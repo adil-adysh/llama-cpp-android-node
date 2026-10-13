@@ -22,6 +22,11 @@ enum class BackendType(val label: String, val arg: String) {
     BOTH("Both (Vulkan + CPU)", "BOTH")
 }
 
+enum class NetworkBinding(val label: String, val host: String) {
+    LOOPBACK("Loopback (127.0.0.1)", "127.0.0.1"),
+    LAN("LAN / Wi-Fi (0.0.0.0)", "0.0.0.0")
+}
+
 object RpcServerManager {
     private const val MAX_LOGS = 500
 
@@ -34,6 +39,7 @@ object RpcServerManager {
     val port = MutableStateFlow(50052)
     val enableCache = MutableStateFlow(true)
     val selectedBackend = MutableStateFlow(BackendType.AUTO)
+    val networkBinding = MutableStateFlow(NetworkBinding.LOOPBACK)
     val threadCount = MutableStateFlow(0)
 
     private val logQueue = ConcurrentLinkedDeque<String>()
@@ -41,7 +47,11 @@ object RpcServerManager {
     val logs: StateFlow<List<String>> = _logs.asStateFlow()
 
     fun refreshIp() {
-        _ipAddress.value = NetworkUtils.getLocalIpAddress()
+        _ipAddress.value = if (networkBinding.value == NetworkBinding.LOOPBACK) {
+            "127.0.0.1"
+        } else {
+            NetworkUtils.getLocalIpAddress()
+        }
     }
 
     fun setState(state: ServerState) {
@@ -66,6 +76,7 @@ object RpcServerManager {
         refreshIp()
         val intent = Intent(context, RpcServerService::class.java).apply {
             action = RpcServerService.ACTION_START
+            putExtra(RpcServerService.EXTRA_HOST, networkBinding.value.host)
             putExtra(RpcServerService.EXTRA_PORT, port.value)
             putExtra(RpcServerService.EXTRA_CACHE, enableCache.value)
             putExtra(RpcServerService.EXTRA_BACKEND, selectedBackend.value.arg)

@@ -44,21 +44,25 @@ class RpcServerService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_START -> {
+                val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
                 val port = intent.getIntExtra(EXTRA_PORT, 50052)
                 val useCache = intent.getBooleanExtra(EXTRA_CACHE, true)
                 val backend = intent.getStringExtra(EXTRA_BACKEND) ?: "AUTO"
                 val threads = intent.getIntExtra(EXTRA_THREADS, 0)
-                startRpcServer(port, useCache, backend, threads)
+                startRpcServer(host, port, useCache, backend, threads)
             }
         }
         return START_STICKY
     }
 
-    private fun startRpcServer(port: Int, useCache: Boolean, backend: String, threads: Int) {
+    private fun startRpcServer(host: String, port: Int, useCache: Boolean, backend: String, threads: Int) {
         if (serverProcess != null) return
 
         RpcServerManager.setState(ServerState.STARTING)
-        RpcServerManager.addLog("--- Starting LlamaNode RPC Server on port $port (Backend: $backend) ---")
+        RpcServerManager.addLog("--- Starting LlamaNode RPC Server on $host:$port (Backend: $backend) ---")
+        if (host == "0.0.0.0") {
+            RpcServerManager.addLog("WARNING: Bound to 0.0.0.0 (LAN). RPC traffic is unauthenticated. Use only on trusted networks.")
+        }
 
         acquireLocks()
         startForeground(NOTIFICATION_ID, buildNotification(port))
@@ -84,7 +88,7 @@ class RpcServerService : Service() {
 
                 val cmd = mutableListOf(
                     binaryFile.absolutePath,
-                    "-H", "0.0.0.0",
+                    "-H", host,
                     "-p", port.toString()
                 )
                 if (useCache) {
@@ -243,6 +247,7 @@ class RpcServerService : Service() {
     companion object {
         const val ACTION_START = "com.llamarpc.node.ACTION_START"
         const val ACTION_STOP = "com.llamarpc.node.ACTION_STOP"
+        const val EXTRA_HOST = "EXTRA_HOST"
         const val EXTRA_PORT = "EXTRA_PORT"
         const val EXTRA_CACHE = "EXTRA_CACHE"
         const val EXTRA_BACKEND = "EXTRA_BACKEND"

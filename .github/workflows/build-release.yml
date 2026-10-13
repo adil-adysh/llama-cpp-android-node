@@ -75,9 +75,9 @@ jobs:
 
       - name: Set up Vulkan & SPIR-V C++ Headers for Android NDK
         run: |
-          echo "Cloning KhronosGroup/Vulkan-Headers & SPIRV-Headers..."
-          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
-          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
+          echo "Cloning KhronosGroup/Vulkan-Headers & SPIRV-Headers (pinned to vulkan-sdk-1.4.304.0)..."
+          git clone --depth 1 --branch vulkan-sdk-1.4.304.0 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          git clone --depth 1 --branch vulkan-sdk-1.4.304.0 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
           
           # Find NDK sysroot include directory
           SYSROOT_INCLUDE=$(find "$ANDROID_NDK_ROOT" -type d -path "*/sysroot/usr/include" | head -n 1)
@@ -93,53 +93,78 @@ jobs:
           cp -r /tmp/spirv-headers/include/spirv/* "$SYSROOT_INCLUDE/spirv/"
           test -f "$SYSROOT_INCLUDE/spirv/unified1/spirv.hpp" || { echo "::error::spirv.hpp not found after copy"; exit 1; }
           
-          echo "Vulkan and SPIR-V C++ headers installed successfully into NDK sysroot."
+          echo "Vulkan and SPIR-V C++ headers (vulkan-sdk-1.4.304.0) installed successfully into NDK sysroot."
 
       - name: Resolve Canonical Upstream Commit SHA
         id: resolve-ref
+        env:
+          RAW_LLAMA_REF: ${{ inputs.llama_ref }}
+          RAW_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          echo "Resolving '${{ inputs.llama_ref }}' against ggml-org/llama.cpp..."
+          # Sanitize inputs to prevent script injection
+          if [[ ! "$RAW_LLAMA_REF" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+            echo "::error::Invalid character in llama_ref: '$RAW_LLAMA_REF'"
+            exit 1
+          fi
+          if [ -n "$RAW_RELEASE_TAG" ] && [[ ! "$RAW_RELEASE_TAG" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+            echo "::error::Invalid character in release_tag: '$RAW_RELEASE_TAG'"
+            exit 1
+          fi
+
+          echo "Resolving '$RAW_LLAMA_REF' against ggml-org/llama.cpp..."
           UPSTREAM_URL="https://github.com/ggml-org/llama.cpp.git"
           
           # Try resolving as tag or branch first
-          COMMIT_SHA=$(git ls-remote "$UPSTREAM_URL" "refs/tags/${{ inputs.llama_ref }}" "refs/heads/${{ inputs.llama_ref }}" | head -n 1 | awk '{print $1}')
+          COMMIT_SHA=$(git ls-remote "$UPSTREAM_URL" "refs/tags/$RAW_LLAMA_REF" "refs/heads/$RAW_LLAMA_REF" | head -n 1 | awk '{print $1}')
           
           # If not found in refs, check if input is a commit SHA or short SHA
           if [ -z "$COMMIT_SHA" ]; then
             git clone --filter=blob:none --no-checkout "$UPSTREAM_URL" llama-probe
             cd llama-probe
-            COMMIT_SHA=$(git rev-parse --verify "${{ inputs.llama_ref }}^{commit}" 2>/dev/null || true)
+            COMMIT_SHA=$(git rev-parse --verify "${RAW_LLAMA_REF}^{commit}" 2>/dev/null || true)
             cd ..
             rm -rf llama-probe
           fi
           
           if [ -z "$COMMIT_SHA" ]; then
-            echo "::error::Could not resolve upstream ref '${{ inputs.llama_ref }}' to a valid commit SHA."
+            echo "::error::Could not resolve upstream ref '$RAW_LLAMA_REF' to a valid commit SHA."
             exit 1
           fi
           
           SHORT_SHA=$(echo "$COMMIT_SHA" | cut -c1-7)
-          TAG_NAME="${{ inputs.release_tag }}"
+          TAG_NAME="$RAW_RELEASE_TAG"
           if [ -z "$TAG_NAME" ]; then
-            TAG_NAME="${{ inputs.llama_ref }}"
+            TAG_NAME="$RAW_LLAMA_REF"
             if [[ ! "$TAG_NAME" =~ ^v ]]; then
               TAG_NAME="v-${TAG_NAME}"
             fi
           fi
           
+          # Compute monotonic Android versionCode
+          NUM_PART=$(echo "$RAW_LLAMA_REF" | tr -dc '0-9')
+          if [[ "$RAW_LLAMA_REF" =~ ^[bv][0-9]+$ ]]; then
+            VERSION_CODE="${RAW_LLAMA_REF#[bv]}"
+          elif [ -n "$NUM_PART" ] && [ "${#NUM_PART}" -le 7 ] && [ "$NUM_PART" -gt 0 ] 2>/dev/null; then
+            VERSION_CODE="$NUM_PART"
+          else
+            VERSION_CODE=$((100000 + GITHUB_RUN_NUMBER))
+          fi
+          
           echo "Resolved Commit SHA: $COMMIT_SHA"
           echo "Short SHA: $SHORT_SHA"
           echo "Release Tag: $TAG_NAME"
+          echo "Version Code: $VERSION_CODE"
           
           echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
 
       - name: Set up Version-Aware ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-llama-android-${{ steps.resolve-ref.outputs.commit_sha }}-${{ env.NDK_VERSION }}-${{ env.ABI }}-vulkan-openmp
+          key: ccache-llama-android-${{ env.NDK_VERSION }}-${{ env.ABI }}-vulkan-openmp-${{ steps.resolve-ref.outputs.commit_sha }}
           restore-keys: |
             ccache-llama-android-${{ env.NDK_VERSION }}-${{ env.ABI }}-vulkan-openmp-
             ccache-llama-android-${{ env.NDK_VERSION }}-${{ env.ABI }}-
@@ -241,7 +266,7 @@ jobs:
           cp "$OMP_PATH" app/src/main/jniLibs/arm64-v8a/libomp.so
           
           chmod +x ./gradlew
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew assembleRelease -PversionCode="${{ steps.resolve-ref.outputs.version_code }}" -PversionName="${{ steps.resolve-ref.outputs.tag_name }}" --no-daemon
 
       - name: Sign APK & Verify Signature
         id: sign-apk
@@ -263,16 +288,16 @@ jobs:
               --out "$TARGET_APK" "$RAW_APK"
             echo "SIGN_TYPE=Official Production Key" >> $GITHUB_ENV
           else
-            echo "Signing with reproducible CI release key..."
-            keytool -genkeypair -v -keystore ci-release.jks -alias llamarpc -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass android -keypass android -dname "CN=llama-cpp-android-node CI, OU=Engineering, O=OpenSource, C=US"
+            echo "Signing with persistent repository CI release keystore..."
+            FALLBACK_KEYSTORE="app/keystore/ci-release.jks"
+            test -f "$FALLBACK_KEYSTORE" || { echo "::error::Fallback keystore $FALLBACK_KEYSTORE not found in repository"; exit 1; }
             "$APKSIGNER" sign \
-              --ks ci-release.jks \
+              --ks "$FALLBACK_KEYSTORE" \
               --ks-key-alias llamarpc \
               --ks-pass pass:android \
               --key-pass pass:android \
               --out "$TARGET_APK" "$RAW_APK"
-            echo "SIGN_TYPE=CI Release Key [Unofficial]" >> $GITHUB_ENV
+            echo "SIGN_TYPE=CI Release Key [Stable Certificate]" >> $GITHUB_ENV
           fi
           
           echo "Verifying APK signature..."
@@ -296,7 +321,7 @@ jobs:
       - name: Clean Up Workspace & Sensitive Secrets
         if: always()
         run: |
-          rm -f release.keystore ci-release.jks
+          rm -f release.keystore
           rm -rf llama-upstream build-android dist/standalone
 
       - name: Publish GitHub Release
@@ -318,6 +343,8 @@ jobs:
             - **Ref Requested:** `${{ inputs.llama_ref }}`
             - **Canonical Commit SHA:** [`${{ steps.resolve-ref.outputs.commit_sha }}`](https://github.com/ggml-org/llama.cpp/commit/${{ steps.resolve-ref.outputs.commit_sha }})
             - **Target Architecture:** `arm64-v8a` (Android API 28+)
+            - **Android Version Code:** `${{ steps.resolve-ref.outputs.version_code }}`
+            - **Vulkan / SPIR-V Headers:** `vulkan-sdk-1.4.304.0` (KhronosGroup)
             - **Compute Backends:** Vulkan GPU (`-DGGML_VULKAN=ON`) + ARM CPU (`-DGGML_OPENMP=ON`)
             - **Cross-Compilation Flag:** `-DGGML_NATIVE=OFF`
             - **Signature Type:** `${{ env.SIGN_TYPE }}`

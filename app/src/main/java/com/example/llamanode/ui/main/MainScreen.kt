@@ -71,6 +71,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.llamanode.service.BackendType
+import com.example.llamanode.service.NetworkBinding
 import com.example.llamanode.service.RpcServerManager
 import com.example.llamanode.service.ServerState
 import com.example.llamanode.updater.UpdateManager
@@ -89,6 +90,7 @@ fun MainScreen(
     val port by RpcServerManager.port.collectAsStateWithLifecycle()
     val enableCache by RpcServerManager.enableCache.collectAsStateWithLifecycle()
     val selectedBackend by RpcServerManager.selectedBackend.collectAsStateWithLifecycle()
+    val networkBinding by RpcServerManager.networkBinding.collectAsStateWithLifecycle()
     val logs by RpcServerManager.logs.collectAsStateWithLifecycle()
 
     var portInput by remember(port) { mutableStateOf(port.toString()) }
@@ -247,6 +249,70 @@ fun MainScreen(
                                     enabled = serverState == ServerState.STOPPED
                                 )
                                 Text("Cache (-c)", style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Network Interface Exposure
+                        Text(
+                            text = "Network Interface Exposure",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            FilterChip(
+                                selected = networkBinding == NetworkBinding.LOOPBACK,
+                                onClick = {
+                                    if (serverState == ServerState.STOPPED) {
+                                        RpcServerManager.networkBinding.value = NetworkBinding.LOOPBACK
+                                        RpcServerManager.refreshIp()
+                                    }
+                                },
+                                label = { Text("Loopback (127.0.0.1 - Safe)", fontSize = 12.sp) },
+                                enabled = serverState == ServerState.STOPPED,
+                                modifier = Modifier.weight(1f)
+                            )
+                            FilterChip(
+                                selected = networkBinding == NetworkBinding.LAN,
+                                onClick = {
+                                    if (serverState == ServerState.STOPPED) {
+                                        RpcServerManager.networkBinding.value = NetworkBinding.LAN
+                                        RpcServerManager.refreshIp()
+                                    }
+                                },
+                                label = { Text("LAN / Wi-Fi (0.0.0.0)", fontSize = 12.sp) },
+                                enabled = serverState == ServerState.STOPPED,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+
+                        // Security Warning Banner when LAN is selected
+                        AnimatedVisibility(visible = networkBinding == NetworkBinding.LAN) {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.8f),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 8.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text("⚠️", fontSize = 16.sp)
+                                    Text(
+                                        text = "Security notice: llama.cpp RPC protocol has no encryption or authentication. Anyone on your local Wi-Fi can run arbitrary computations.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
                             }
                         }
 

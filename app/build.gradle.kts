@@ -4,15 +4,18 @@ plugins {
   alias(libs.plugins.kotlin.serialization)
 }
 
+val customVersionCode = providers.gradleProperty("versionCode").map { it.toInt() }.getOrElse(1)
+val customVersionName = providers.gradleProperty("versionName").getOrElse("1.0")
+
 android {
     namespace = "com.example.llamanode"
     compileSdk = 36
     defaultConfig {
         applicationId = "com.llamarpc.node"
-        minSdk = 24
+        minSdk = 28
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = customVersionCode
+        versionName = customVersionName
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
