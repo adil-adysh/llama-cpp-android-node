@@ -1,0 +1,302 @@
+name: Build & Release llama.cpp Android Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: 'Upstream ggml-org/llama.cpp tag, branch, or commit SHA'
+        required: true
+        default: 'b11429'
+        type: string
+      release_tag:
+        description: 'Release tag (leave blank to auto-generate, e.g. v-b11429)'
+        required: false
+        default: ''
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: '28.0.12433566'
+  ANDROID_API: '28'
+  ABI: 'arm64-v8a'
+
+jobs:
+  build-and-release:
+    name: Build & Release (${{ inputs.llama_ref }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          lfs: false # Skip LFS download since CI will cross-compile fresh
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          cache-read-only: false
+
+      - name: Set up Android NDK
+        run: |
+          echo "Setting up Android NDK..."
+          if [ -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]; then
+            echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION" >> $GITHUB_ENV
+          elif [ -d "$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" ]; then
+            echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> $GITHUB_ENV
+          else
+            SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools" -name sdkmanager 2>/dev/null | head -n 1)
+            if [ -n "$SDKMANAGER" ]; then
+              echo "Installing Android NDK $NDK_VERSION via sdkmanager..."
+              yes | "$SDKMANAGER" --install "ndk;$NDK_VERSION"
+              echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION" >> $GITHUB_ENV
+            else
+              PREINSTALLED_NDK=$(find "$ANDROID_HOME/ndk" "$ANDROID_SDK_ROOT/ndk" -maxdepth 1 -mindepth 1 2>/dev/null | sort -V | tail -n 1)
+              echo "Using preinstalled NDK at $PREINSTALLED_NDK"
+              echo "ANDROID_NDK_ROOT=$PREINSTALLED_NDK" >> $GITHUB_ENV
+            fi
+          fi
+
+      - name: Install Host Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev glslc libomp-dev ccache ninja-build
+
+      - name: Resolve Canonical Upstream Commit SHA
+        id: resolve-ref
+        run: |
+          echo "Resolving '${{ inputs.llama_ref }}' against ggml-org/llama.cpp..."
+          UPSTREAM_URL="https://github.com/ggml-org/llama.cpp.git"
+          
+          # Try resolving as tag or branch first
+          COMMIT_SHA=$(git ls-remote "$UPSTREAM_URL" "refs/tags/${{ inputs.llama_ref }}" "refs/heads/${{ inputs.llama_ref }}" | head -n 1 | awk '{print $1}')
+          
+          # If not found in refs, check if input is a commit SHA or short SHA
+          if [ -z "$COMMIT_SHA" ]; then
+            git clone --filter=blob:none --no-checkout "$UPSTREAM_URL" llama-probe
+            cd llama-probe
+            COMMIT_SHA=$(git rev-parse --verify "${{ inputs.llama_ref }}^{commit}" 2>/dev/null || true)
+            cd ..
+            rm -rf llama-probe
+          fi
+          
+          if [ -z "$COMMIT_SHA" ]; then
+            echo "::error::Could not resolve upstream ref '${{ inputs.llama_ref }}' to a valid commit SHA."
+            exit 1
+          fi
+          
+          SHORT_SHA=$(echo "$COMMIT_SHA" | cut -c1-7)
+          TAG_NAME="${{ inputs.release_tag }}"
+          if [ -z "$TAG_NAME" ]; then
+            TAG_NAME="${{ inputs.llama_ref }}"
+            if [[ ! "$TAG_NAME" =~ ^v ]]; then
+              TAG_NAME="v-${TAG_NAME}"
+            fi
+          fi
+          
+          echo "Resolved Commit SHA: $COMMIT_SHA"
+          echo "Short SHA: $SHORT_SHA"
+          echo "Release Tag: $TAG_NAME"
+          
+          echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Set up Version-Aware ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-llama-android-${{ steps.resolve-ref.outputs.commit_sha }}-${{ env.NDK_VERSION }}-${{ env.ABI }}-vulkan-openmp
+          restore-keys: |
+            ccache-llama-android-${{ env.NDK_VERSION }}-${{ env.ABI }}-vulkan-openmp-
+            ccache-llama-android-${{ env.NDK_VERSION }}-${{ env.ABI }}-
+
+      - name: Clone Upstream llama.cpp at Canonical SHA
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git llama-upstream
+          cd llama-upstream
+          git fetch --depth 1 origin ${{ steps.resolve-ref.outputs.commit_sha }}
+          git checkout ${{ steps.resolve-ref.outputs.commit_sha }}
+          echo "Upstream checked out at $(git log -1 --oneline)"
+
+      - name: Cross-Compile ggml-rpc-server (Vulkan GPU + OpenMP CPU)
+        run: |
+          ccache -z
+          cmake -B build-android -S llama-upstream \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=$ABI \
+            -DANDROID_PLATFORM=android-$ANDROID_API \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_VULKAN=ON \
+            -DGGML_OPENMP=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_TOOLS=ON
+          
+          ninja -C build-android ggml-rpc-server
+          ccache -s
+
+      - name: Validate Native ELF & Dependencies
+        id: validate-elf
+        run: |
+          SERVER_BIN="build-android/bin/ggml-rpc-server"
+          READELF=$(find "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt" -name "llvm-readelf" 2>/dev/null | head -n 1)
+          STRIP=$(find "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt" -name "llvm-strip" 2>/dev/null | head -n 1)
+          
+          test -f "$SERVER_BIN" || { echo "::error::ggml-rpc-server binary was not produced"; exit 1; }
+          
+          # Verify ELF Header (AArch64)
+          "$READELF" -h "$SERVER_BIN" | grep -E "AArch64|aarch64" || { echo "::error::Target architecture is not AArch64"; exit 1; }
+          
+          # Verify Dynamic Section (libvulkan.so and libomp.so)
+          DYNAMIC_DEPS=$("$READELF" -d "$SERVER_BIN")
+          echo "$DYNAMIC_DEPS" | grep "Shared library: \[libvulkan.so\]" || { echo "::error::Missing libvulkan.so dependency"; exit 1; }
+          echo "$DYNAMIC_DEPS" | grep "Shared library: \[libomp.so\]" || { echo "::error::Missing libomp.so dependency"; exit 1; }
+          
+          # Strip debug symbols
+          "$STRIP" --strip-unneeded "$SERVER_BIN"
+
+      - name: Package Standalone CLI Tarball
+        run: |
+          TAG="${{ steps.resolve-ref.outputs.tag_name }}"
+          DIST_DIR="dist/standalone"
+          mkdir -p "$DIST_DIR"
+          
+          # Find NDK libomp.so
+          OMP_PATH=$(find "$ANDROID_NDK_ROOT" -name libomp.so | grep -E 'aarch64' | head -n 1)
+          test -f "$OMP_PATH" || { echo "::error::libomp.so not found in NDK"; exit 1; }
+          
+          cp build-android/bin/ggml-rpc-server "$DIST_DIR/ggml-rpc-server"
+          cp "$OMP_PATH" "$DIST_DIR/libomp.so"
+          
+          cat << 'EOF' > "$DIST_DIR/README.txt"
+          llama.cpp Android RPC Server (arm64-v8a • Vulkan GPU + OpenMP CPU)
+          ==================================================================
+          To run directly on device via ADB:
+            adb push ggml-rpc-server libomp.so /data/local/tmp/
+            adb shell "chmod 755 /data/local/tmp/ggml-rpc-server"
+            adb shell "export LD_LIBRARY_PATH=/data/local/tmp:\$LD_LIBRARY_PATH; /data/local/tmp/ggml-rpc-server -H 0.0.0.0 -p 50052"
+          
+          To connect from PC host:
+            adb forward tcp:50052 tcp:50052
+            llama-cli.exe -m model.gguf --rpc 127.0.0.1:50052 -ngl 99 -p "Hello"
+          EOF
+          
+          TARBALL="llama-rpc-server-android-arm64-vulkan-${TAG}.tar.gz"
+          tar -czvf "$TARBALL" -C "$DIST_DIR" ggml-rpc-server libomp.so README.txt
+          echo "TARBALL_PATH=$TARBALL" >> $GITHUB_ENV
+
+      - name: Prepare APK jniLibs & Build Release APK
+        run: |
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp build-android/bin/ggml-rpc-server app/src/main/jniLibs/arm64-v8a/libggml-rpc-server.so
+          OMP_PATH=$(find "$ANDROID_NDK_ROOT" -name libomp.so | grep -E 'aarch64' | head -n 1)
+          cp "$OMP_PATH" app/src/main/jniLibs/arm64-v8a/libomp.so
+          
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK & Verify Signature
+        id: sign-apk
+        run: |
+          TAG="${{ steps.resolve-ref.outputs.tag_name }}"
+          RAW_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          TARGET_APK="llama-cpp-android-node-${TAG}.apk"
+          
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" "$ANDROID_SDK_ROOT/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1)
+          
+          if [ -n "${{ secrets.SIGNING_KEYSTORE_BASE64 }}" ]; then
+            echo "Signing with production repository keystore..."
+            echo "${{ secrets.SIGNING_KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+            "$APKSIGNER" sign \
+              --ks release.keystore \
+              --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+              --ks-pass "pass:${{ secrets.KEYSTORE_PASSWORD }}" \
+              --key-pass "pass:${{ secrets.KEY_PASSWORD }}" \
+              --out "$TARGET_APK" "$RAW_APK"
+            echo "SIGN_TYPE=Official Production Key" >> $GITHUB_ENV
+          else
+            echo "Signing with reproducible CI release key..."
+            keytool -genkeypair -v -keystore ci-release.jks -alias llamarpc -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android -dname "CN=llama-cpp-android-node CI, OU=Engineering, O=OpenSource, C=US"
+            "$APKSIGNER" sign \
+              --ks ci-release.jks \
+              --ks-key-alias llamarpc \
+              --ks-pass pass:android \
+              --key-pass pass:android \
+              --out "$TARGET_APK" "$RAW_APK"
+            echo "SIGN_TYPE=CI Release Key [Unofficial]" >> $GITHUB_ENV
+          fi
+          
+          echo "Verifying APK signature..."
+          "$APKSIGNER" verify --verbose "$TARGET_APK"
+          echo "APK_PATH=$TARGET_APK" >> $GITHUB_ENV
+
+      - name: Pre-Release Verification Gate
+        run: |
+          echo "=== Verifying APK Native Library Content ==="
+          unzip -l "$APK_PATH" | grep "lib/arm64-v8a/libggml-rpc-server.so" || { echo "::error::libggml-rpc-server.so missing in APK"; exit 1; }
+          unzip -l "$APK_PATH" | grep "lib/arm64-v8a/libomp.so" || { echo "::error::libomp.so missing in APK"; exit 1; }
+          
+          echo "=== Verifying Standalone Tarball Content ==="
+          tar -tzf "$TARBALL_PATH" | grep "ggml-rpc-server" || { echo "::error::ggml-rpc-server missing in tarball"; exit 1; }
+          tar -tzf "$TARBALL_PATH" | grep "libomp.so" || { echo "::error::libomp.so missing in tarball"; exit 1; }
+          
+          echo "=== Generating Checksums ==="
+          sha256sum "$APK_PATH" "$TARBALL_PATH" > checksums.txt
+          cat checksums.txt
+
+      - name: Clean Up Workspace & Sensitive Secrets
+        if: always()
+        run: |
+          rm -f release.keystore ci-release.jks
+          rm -rf llama-upstream build-android dist/standalone
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve-ref.outputs.tag_name }}
+          name: "llama.cpp Android Node - ${{ steps.resolve-ref.outputs.tag_name }}"
+          prerelease: ${{ inputs.prerelease }}
+          files: |
+            ${{ env.APK_PATH }}
+            ${{ env.TARBALL_PATH }}
+            checksums.txt
+          body: |
+            ### llama.cpp Android RPC Distributed Inference Node
+            
+            Automated release built against upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+            
+            #### Upstream Metadata
+            - **Ref Requested:** `${{ inputs.llama_ref }}`
+            - **Canonical Commit SHA:** [`${{ steps.resolve-ref.outputs.commit_sha }}`](https://github.com/ggml-org/llama.cpp/commit/${{ steps.resolve-ref.outputs.commit_sha }})
+            - **Target Architecture:** `arm64-v8a` (Android API 28+)
+            - **Compute Backends:** Vulkan GPU (`-DGGML_VULKAN=ON`) + ARM CPU (`-DGGML_OPENMP=ON`)
+            - **Cross-Compilation Flag:** `-DGGML_NATIVE=OFF`
+            - **Signature Type:** `${{ env.SIGN_TYPE }}`
+            
+            #### Assets Included
+            1. **`${{ env.APK_PATH }}`**: Installable Android application with foreground RPC server service and dynamic backend selection.
+            2. **`${{ env.TARBALL_PATH }}`**: Standalone NDK ELF binary and OpenMP runtime for direct ADB / Termux execution.
+            3. **`checksums.txt`**: SHA-256 verification hashes.
+            
+            #### Quick Connect Example
+            ```powershell
+            # Connect from Windows PC host
+            llama-cli.exe -m model.gguf --rpc <PHONE_IP>:50052 -ngl 99 -p "Hello from Windows"
+            ```
