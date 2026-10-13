@@ -73,10 +73,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libvulkan-dev glslc spirv-headers spirv-tools glslang-tools libomp-dev ccache ninja-build
 
-      - name: Set up Vulkan C++ Headers for Android NDK
+      - name: Set up Vulkan & SPIR-V C++ Headers for Android NDK
         run: |
-          echo "Cloning KhronosGroup/Vulkan-Headers..."
+          echo "Cloning KhronosGroup/Vulkan-Headers & SPIRV-Headers..."
           git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
           
           # Find NDK sysroot include directory
           SYSROOT_INCLUDE=$(find "$ANDROID_NDK_ROOT" -type d -path "*/sysroot/usr/include" | head -n 1)
@@ -86,7 +87,13 @@ jobs:
           mkdir -p "$SYSROOT_INCLUDE/vulkan"
           cp -r /tmp/vulkan-headers/include/vulkan/* "$SYSROOT_INCLUDE/vulkan/"
           test -f "$SYSROOT_INCLUDE/vulkan/vulkan.hpp" || { echo "::error::vulkan.hpp not found after copy"; exit 1; }
-          echo "Vulkan C++ headers installed successfully."
+          
+          echo "Installing SPIR-V headers into $SYSROOT_INCLUDE/spirv..."
+          mkdir -p "$SYSROOT_INCLUDE/spirv"
+          cp -r /tmp/spirv-headers/include/spirv/* "$SYSROOT_INCLUDE/spirv/"
+          test -f "$SYSROOT_INCLUDE/spirv/unified1/spirv.hpp" || { echo "::error::spirv.hpp not found after copy"; exit 1; }
+          
+          echo "Vulkan and SPIR-V C++ headers installed successfully into NDK sysroot."
 
       - name: Resolve Canonical Upstream Commit SHA
         id: resolve-ref
