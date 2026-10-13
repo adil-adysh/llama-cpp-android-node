@@ -139,6 +139,10 @@ jobs:
           APP_VERSION="0.2.0"
 
           if [ -n "$RAW_RELEASE_TAG" ]; then
+            if git ls-remote --tags origin "refs/tags/${RAW_RELEASE_TAG}" | grep -q "${RAW_RELEASE_TAG}"; then
+              echo "::error::Release tag '$RAW_RELEASE_TAG' already exists on remote repository. Cannot overwrite existing immutable release."
+              exit 1
+            fi
             TAG_NAME="$RAW_RELEASE_TAG"
           else
             BASE_TAG="v${APP_VERSION}-${RAW_LLAMA_REF}"
@@ -150,6 +154,14 @@ jobs:
             fi
           fi
           
+          if git ls-remote --tags origin "refs/tags/${TAG_NAME}" | grep -q "${TAG_NAME}"; then
+            echo "::error::Resolved tag '$TAG_NAME' already exists on remote repository."
+            exit 1
+          fi
+
+          # Sanitize artifact filename independently of git tag
+          SAFE_TAG=$(echo "$TAG_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          
           # Strictly monotonic Android versionCode independent of upstream naming
           APP_BASE_CODE=20000
           VERSION_CODE=$(( APP_BASE_CODE + GITHUB_RUN_NUMBER ))
@@ -157,11 +169,13 @@ jobs:
           echo "Resolved Commit SHA: $COMMIT_SHA"
           echo "Short SHA: $SHORT_SHA"
           echo "Release Tag: $TAG_NAME"
+          echo "Safe Tag (Filename): $SAFE_TAG"
           echo "Version Code: $VERSION_CODE"
           
           echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "safe_tag=$SAFE_TAG" >> $GITHUB_OUTPUT
           echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
 
       - name: Set up Version-Aware ccache
@@ -235,7 +249,7 @@ jobs:
 
       - name: Package Standalone CLI Tarball
         run: |
-          TAG="${{ steps.resolve-ref.outputs.tag_name }}"
+          SAFE_TAG="${{ steps.resolve-ref.outputs.safe_tag }}"
           DIST_DIR="dist/standalone"
           mkdir -p "$DIST_DIR"
           
@@ -259,7 +273,7 @@ jobs:
             llama-cli.exe -m model.gguf --rpc 127.0.0.1:50052 -ngl 99 -p "Hello"
           EOF
           
-          TARBALL="llama-rpc-server-android-arm64-vulkan-${TAG}.tar.gz"
+          TARBALL="llama-rpc-server-android-arm64-vulkan-${SAFE_TAG}.tar.gz"
           tar -czvf "$TARBALL" -C "$DIST_DIR" ggml-rpc-server libomp.so README.txt
           echo "TARBALL_PATH=$TARBALL" >> $GITHUB_ENV
 
@@ -277,9 +291,9 @@ jobs:
       - name: Sign APK & Verify Signature
         id: sign-apk
         run: |
-          TAG="${{ steps.resolve-ref.outputs.tag_name }}"
+          SAFE_TAG="${{ steps.resolve-ref.outputs.safe_tag }}"
           RAW_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
-          TARGET_APK="llama-cpp-android-node-${TAG}.apk"
+          TARGET_APK="llama-cpp-android-node-${SAFE_TAG}.apk"
           
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" "$ANDROID_SDK_ROOT/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1)
           

@@ -88,9 +88,36 @@ object UpdateManager {
 
     fun isTagNewerThan(remoteTag: String, localVersion: String): Boolean {
         if (remoteTag.isBlank() || remoteTag == "unknown") return false
-        val cleanRemote = remoteTag.trim().removePrefix("v")
-        val cleanLocal = localVersion.trim().removePrefix("v")
-        return cleanRemote != cleanLocal
+        val cleanRemote = remoteTag.trim().removePrefix("v").substringBefore("-")
+        val cleanLocal = localVersion.trim().removePrefix("v").substringBefore("-")
+
+        val remoteParts = cleanRemote.split(".").mapNotNull { it.toIntOrNull() }
+        val localParts = cleanLocal.split(".").mapNotNull { it.toIntOrNull() }
+
+        if (remoteParts.isEmpty() || localParts.isEmpty()) {
+            return false
+        }
+
+        val maxLen = maxOf(remoteParts.size, localParts.size)
+        for (i in 0 until maxLen) {
+            val r = remoteParts.getOrElse(i) { 0 }
+            val l = localParts.getOrElse(i) { 0 }
+            if (r > l) return true
+            if (r < l) return false
+        }
+
+        // Check run numbers if versions match (e.g. v0.2.0-b11429.r2 vs v0.2.0-b11429)
+        val remoteSuffix = remoteTag.substringAfter("-", "")
+        val localSuffix = localVersion.substringAfter("-", "")
+        if (remoteSuffix.contains(".r") && localSuffix.contains(".r")) {
+            val rRun = remoteSuffix.substringAfter(".r").takeWhile { it.isDigit() }.toIntOrNull() ?: 0
+            val lRun = localSuffix.substringAfter(".r").takeWhile { it.isDigit() }.toIntOrNull() ?: 0
+            return rRun > lRun
+        } else if (remoteSuffix.contains(".r") && !localSuffix.contains(".r")) {
+            return true
+        }
+
+        return false
     }
 
     /**

@@ -387,8 +387,10 @@ fun MainScreen(
                                         color = MaterialTheme.colorScheme.primary,
                                         modifier = Modifier
                                             .clickable(enabled = serverState == ServerState.STOPPED) {
-                                                RpcServerManager.clearCache(context)
-                                                Toast.makeText(context, "Cache cleared", Toast.LENGTH_SHORT).show()
+                                                scope.launch {
+                                                    RpcServerManager.clearCache(context)
+                                                    Toast.makeText(context, "Cache cleared", Toast.LENGTH_SHORT).show()
+                                                }
                                             }
                                             .semantics { contentDescription = "Clear tensor cache on disk" }
                                     )

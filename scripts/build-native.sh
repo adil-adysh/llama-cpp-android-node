@@ -24,6 +24,34 @@ fi
 
 echo "==> Using Android NDK: $NDK_PATH"
 
+SYSROOT_INCLUDE=$(find "$NDK_PATH" -type d -path "*/sysroot/usr/include" | head -n 1)
+test -d "$SYSROOT_INCLUDE" || { echo "NDK sysroot include directory not found"; exit 1; }
+
+VULKAN_HPP="$SYSROOT_INCLUDE/vulkan/vulkan.hpp"
+SPIRV_HPP="$SYSROOT_INCLUDE/spirv/unified1/spirv.hpp"
+
+if [ ! -f "$VULKAN_HPP" ] || [ ! -f "$SPIRV_HPP" ]; then
+  echo "==> Setting up Vulkan & SPIR-V C++ Headers (vulkan-sdk-1.4.304.0) for Android NDK..."
+  HEADER_TMP="$PROJECT_ROOT/build/temp-headers"
+  rm -rf "$HEADER_TMP"
+  mkdir -p "$HEADER_TMP"
+  
+  if [ ! -f "$VULKAN_HPP" ]; then
+    git clone --depth 1 --branch vulkan-sdk-1.4.304.0 https://github.com/KhronosGroup/Vulkan-Headers.git "$HEADER_TMP/vulkan-headers"
+    mkdir -p "$SYSROOT_INCLUDE/vulkan"
+    cp -r "$HEADER_TMP/vulkan-headers/include/vulkan/"* "$SYSROOT_INCLUDE/vulkan/"
+  fi
+  
+  if [ ! -f "$SPIRV_HPP" ]; then
+    git clone --depth 1 --branch vulkan-sdk-1.4.304.0 https://github.com/KhronosGroup/SPIRV-Headers.git "$HEADER_TMP/spirv-headers"
+    mkdir -p "$SYSROOT_INCLUDE/spirv"
+    cp -r "$HEADER_TMP/spirv-headers/include/spirv/"* "$SYSROOT_INCLUDE/spirv/"
+  fi
+  
+  rm -rf "$HEADER_TMP"
+  echo "==> Vulkan and SPIR-V headers successfully installed into $SYSROOT_INCLUDE"
+fi
+
 if [ ! -d "$UPSTREAM_DIR" ]; then
   echo "==> Cloning ggml-org/llama.cpp..."
   git clone https://github.com/ggml-org/llama.cpp.git "$UPSTREAM_DIR"

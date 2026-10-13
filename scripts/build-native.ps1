@@ -29,6 +29,38 @@ if (-not $NdkPath -or -not (Test-Path $NdkPath)) {
 
 Write-Host "==> Using Android NDK: $NdkPath" -ForegroundColor Cyan
 
+$sysrootInclude = Get-ChildItem -Path $NdkPath -Directory -Recurse | Where-Object { $_.FullName -like "*sysroot\usr\include" } | Select-Object -First 1
+if (-not $sysrootInclude) {
+    throw "NDK sysroot include directory not found in $NdkPath"
+}
+
+$vulkanHpp = Join-Path $sysrootInclude.FullName "vulkan\vulkan.hpp"
+$spirvHpp = Join-Path $sysrootInclude.FullName "spirv\unified1\spirv.hpp"
+
+if (-not (Test-Path $vulkanHpp) -or -not (Test-Path $spirvHpp)) {
+    Write-Host "==> Setting up Vulkan & SPIR-V C++ Headers (vulkan-sdk-1.4.304.0) for Android NDK..." -ForegroundColor Cyan
+    $headerTmp = Join-Path $projectRoot "build\temp-headers"
+    if (Test-Path $headerTmp) { Remove-Item -Recurse -Force $headerTmp }
+    New-Item -ItemType Directory -Path $headerTmp -Force | Out-Null
+
+    if (-not (Test-Path $vulkanHpp)) {
+        git clone --depth 1 --branch vulkan-sdk-1.4.304.0 https://github.com/KhronosGroup/Vulkan-Headers.git "$headerTmp\vulkan-headers"
+        $destVulkan = Join-Path $sysrootInclude.FullName "vulkan"
+        New-Item -ItemType Directory -Path $destVulkan -Force | Out-Null
+        Copy-Item -Path "$headerTmp\vulkan-headers\include\vulkan\*" -Destination $destVulkan -Recurse -Force
+    }
+
+    if (-not (Test-Path $spirvHpp)) {
+        git clone --depth 1 --branch vulkan-sdk-1.4.304.0 https://github.com/KhronosGroup/SPIRV-Headers.git "$headerTmp\spirv-headers"
+        $destSpirv = Join-Path $sysrootInclude.FullName "spirv"
+        New-Item -ItemType Directory -Path $destSpirv -Force | Out-Null
+        Copy-Item -Path "$headerTmp\spirv-headers\include\spirv\*" -Destination $destSpirv -Recurse -Force
+    }
+
+    Remove-Item -Recurse -Force $headerTmp
+    Write-Host "==> Vulkan and SPIR-V headers successfully installed into $($sysrootInclude.FullName)" -ForegroundColor Green
+}
+
 # Clone or update upstream llama.cpp
 if (-not (Test-Path $upstreamDir)) {
     Write-Host "==> Cloning ggml-org/llama.cpp..." -ForegroundColor Cyan

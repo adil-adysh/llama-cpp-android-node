@@ -45,10 +45,26 @@ class UpdateManagerTest {
 
     @Test
     fun testIsTagNewerThan() {
+        // Newer versions
         assertTrue(UpdateManager.isTagNewerThan("v0.3.0-b11429", "0.2.0"))
         assertTrue(UpdateManager.isTagNewerThan("v0.2.1-b11429", "v0.2.0-b11429"))
+        assertTrue(UpdateManager.isTagNewerThan("v1.0.0", "0.9.9"))
+        assertTrue(UpdateManager.isTagNewerThan("v0.2.0-b11429.r2", "v0.2.0-b11429"))
+        assertTrue(UpdateManager.isTagNewerThan("v0.2.0-b11429.r3", "v0.2.0-b11429.r2"))
+
+        // Equal versions
         assertFalse(UpdateManager.isTagNewerThan("v0.2.0-b11429", "0.2.0-b11429"))
-        assertFalse(UpdateManager.isTagNewerThan("v0.2.0-b11429", "v0.2.0-b11429"))
+        assertFalse(UpdateManager.isTagNewerThan("v0.2.0", "0.2.0"))
+        assertFalse(UpdateManager.isTagNewerThan("0.2.0", "v0.2.0"))
+        assertFalse(UpdateManager.isTagNewerThan("v0.2.0-b11429.r2", "v0.2.0-b11429.r2"))
+
+        // Older versions (MUST NOT be treated as newer)
+        assertFalse(UpdateManager.isTagNewerThan("v0.1.0-b11429", "0.2.0-b11429"))
+        assertFalse(UpdateManager.isTagNewerThan("v0.2.0", "v0.2.1"))
+        assertFalse(UpdateManager.isTagNewerThan("v0.1.9", "v0.2.0"))
+        assertFalse(UpdateManager.isTagNewerThan("v0.2.0-b11429.r1", "v0.2.0-b11429.r2"))
+
+        // Invalid / empty inputs
         assertFalse(UpdateManager.isTagNewerThan("", "0.2.0"))
         assertFalse(UpdateManager.isTagNewerThan("unknown", "0.2.0"))
     }

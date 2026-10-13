@@ -20,7 +20,7 @@ $downloadCmd = "gh release download"
 if ($Tag -ne "latest") {
     $downloadCmd += " $Tag"
 }
-$downloadCmd += " -R $Repo -p `"*.tar.gz`" -D `"$tempDir`" --clobber"
+$downloadCmd += " -R $Repo -p `"*.tar.gz`" -p `"checksums.txt`" -D `"$tempDir`" --clobber"
 
 Write-Host "Running: $downloadCmd"
 Invoke-Expression $downloadCmd
@@ -28,6 +28,24 @@ Invoke-Expression $downloadCmd
 $tarball = Get-ChildItem -Path $tempDir -Filter "*.tar.gz" | Select-Object -First 1
 if (-not $tarball) {
     throw "No tarball found in release download."
+}
+
+$checksumsFile = Join-Path $tempDir "checksums.txt"
+if (Test-Path $checksumsFile) {
+    Write-Host "==> Verifying SHA-256 checksum for $($tarball.Name)..." -ForegroundColor Cyan
+    $checksumLines = Get-Content $checksumsFile
+    $expectedLine = $checksumLines | Where-Object { $_ -match [regex]::Escape($tarball.Name) } | Select-Object -First 1
+    if (-not $expectedLine) {
+        throw "Checksum for $($tarball.Name) not found in checksums.txt"
+    }
+    $expectedSha = ($expectedLine -split "\s+")[0].Trim()
+    $actualSha = (Get-FileHash -Path $tarball.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($expectedSha.ToLowerInvariant() -ne $actualSha) {
+        throw "Checksum mismatch for $($tarball.Name)! Expected: $expectedSha, Actual: $actualSha"
+    }
+    Write-Host "==> Checksum verified successfully ($actualSha)" -ForegroundColor Green
+} else {
+    Write-Warning "checksums.txt not found in release assets."
 }
 
 Write-Host "Extracting $($tarball.FullName)..."

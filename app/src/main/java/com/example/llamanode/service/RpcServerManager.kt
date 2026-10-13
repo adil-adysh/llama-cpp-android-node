@@ -3,9 +3,11 @@ package com.example.llamanode.service
 import android.content.Context
 import android.content.Intent
 import com.example.llamanode.util.NetworkUtils
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentLinkedDeque
 
@@ -88,22 +90,25 @@ object RpcServerManager {
         return File(context.cacheDir, "llama_rpc")
     }
 
-    fun refreshCacheSize(context: Context) {
-        val dir = getCacheDirectory(context)
+    suspend fun refreshCacheSize(dir: File): Long = withContext(Dispatchers.IO) {
         if (!dir.exists()) {
             _cacheSizeBytes.value = 0L
-            return
+            return@withContext 0L
         }
         val size = dir.walkTopDown().filter { it.isFile }.map { it.length() }.sum()
         _cacheSizeBytes.value = size
+        size
     }
 
-    fun clearCache(context: Context): Boolean {
-        val dir = getCacheDirectory(context)
+    suspend fun refreshCacheSize(context: Context): Long = refreshCacheSize(getCacheDirectory(context))
+
+    suspend fun clearCache(dir: File): Boolean = withContext(Dispatchers.IO) {
         val deleted = if (dir.exists()) dir.deleteRecursively() else true
-        refreshCacheSize(context)
-        return deleted
+        refreshCacheSize(dir)
+        deleted
     }
+
+    suspend fun clearCache(context: Context): Boolean = clearCache(getCacheDirectory(context))
 
     fun addLog(message: String) {
         logQueue.add(message)

@@ -1,5 +1,6 @@
 package com.example.llamanode.service
 
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -7,6 +8,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.io.File
 
 class ServerStateTest {
 
@@ -70,5 +72,32 @@ class ServerStateTest {
         assertEquals(500, logs.size)
         assertEquals("Log entry 101", logs.first())
         assertEquals("Log entry 600", logs.last())
+    }
+
+    @Test
+    fun testCacheScanningAndDeletion() = runBlocking {
+        val tempCache = File(System.getProperty("java.io.tmpdir"), "llamanode_cache_test_" + System.currentTimeMillis())
+        tempCache.mkdirs()
+        try {
+            // Create nested directory and dummy files
+            val subDir = File(tempCache, "models")
+            subDir.mkdirs()
+            val file1 = File(tempCache, "tensor1.bin")
+            file1.writeBytes(ByteArray(1024)) // 1 KB
+            val file2 = File(subDir, "tensor2.bin")
+            file2.writeBytes(ByteArray(2048)) // 2 KB
+
+            val initialSize = RpcServerManager.refreshCacheSize(tempCache)
+            assertEquals(3072L, initialSize)
+            assertEquals(3072L, RpcServerManager.cacheSizeBytes.value)
+
+            val cleared = RpcServerManager.clearCache(tempCache)
+            assertTrue(cleared)
+            assertEquals(0L, RpcServerManager.cacheSizeBytes.value)
+            assertFalse(file1.exists())
+            assertFalse(file2.exists())
+        } finally {
+            tempCache.deleteRecursively()
+        }
     }
 }
