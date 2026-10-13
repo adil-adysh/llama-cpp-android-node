@@ -1,6 +1,8 @@
-# LlamaNode 🦙📱
+# llama-cpp-android-node 🦙📱
 
-**LlamaNode** is a high-performance Android application that runs `llama.cpp`'s `ggml-rpc-server` as a persistent background service. It transforms any modern Android device into a high-speed distributed inference node for your PC or server cluster over Wi-Fi or USB.
+**llama.cpp Android RPC Distributed Inference Node (LlamaNode)**
+
+`llama-cpp-android-node` is a high-performance Android application that runs `llama.cpp`'s `ggml-rpc-server` as a persistent background service. It transforms any modern Android device into a high-speed distributed inference node for your PC or server cluster over Wi-Fi or USB.
 
 ---
 
