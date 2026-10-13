@@ -142,6 +142,7 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DGGML_NATIVE=OFF \
+            -DGGML_RPC=ON \
             -DGGML_VULKAN=ON \
             -DGGML_OPENMP=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -149,6 +150,7 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_COMMON=ON \
             -DLLAMA_BUILD_TOOLS=ON
           
           ninja -C build-android ggml-rpc-server
@@ -211,6 +213,7 @@ jobs:
           OMP_PATH=$(find "$ANDROID_NDK_ROOT" -name libomp.so | grep -E 'aarch64' | head -n 1)
           cp "$OMP_PATH" app/src/main/jniLibs/arm64-v8a/libomp.so
           
+          chmod +x ./gradlew
           ./gradlew assembleRelease --no-daemon
 
       - name: Sign APK & Verify Signature
