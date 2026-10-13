@@ -38,7 +38,7 @@ jobs:
           lfs: false # Skip LFS download since CI will cross-compile fresh
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -72,6 +72,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libvulkan-dev glslc spirv-headers spirv-tools glslang-tools libomp-dev ccache ninja-build
+
+      - name: Set up Vulkan C++ Headers for Android NDK
+        run: |
+          echo "Cloning KhronosGroup/Vulkan-Headers..."
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          
+          # Find NDK sysroot include directory
+          SYSROOT_INCLUDE=$(find "$ANDROID_NDK_ROOT" -type d -path "*/sysroot/usr/include" | head -n 1)
+          test -d "$SYSROOT_INCLUDE" || { echo "::error::NDK sysroot include directory not found"; exit 1; }
+          
+          echo "Installing Vulkan C++ headers into $SYSROOT_INCLUDE/vulkan..."
+          mkdir -p "$SYSROOT_INCLUDE/vulkan"
+          cp -r /tmp/vulkan-headers/include/vulkan/* "$SYSROOT_INCLUDE/vulkan/"
+          test -f "$SYSROOT_INCLUDE/vulkan/vulkan.hpp" || { echo "::error::vulkan.hpp not found after copy"; exit 1; }
+          echo "Vulkan C++ headers installed successfully."
 
       - name: Resolve Canonical Upstream Commit SHA
         id: resolve-ref
@@ -141,6 +156,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DVulkan_INCLUDE_DIR=/tmp/vulkan-headers/include \
             -DGGML_NATIVE=OFF \
             -DGGML_RPC=ON \
             -DGGML_VULKAN=ON \
