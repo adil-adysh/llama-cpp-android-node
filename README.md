@@ -34,6 +34,11 @@ The bundled `libggml-rpc-server.so` is cross-compiled against `llama.cpp` (b1142
 
 ```powershell
 cd LlamaNode
+
+# Step 1: Provision verified prebuilt native binaries (or compile via .\scripts\build-native.ps1)
+.\scripts\fetch-prebuilt-native.ps1
+
+# Step 2: Assemble and install the Android application
 .\gradlew.bat assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
@@ -42,12 +47,13 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 1. Open **LlamaNode** on your device.
 2. Select your desired compute backend (**Auto**, **Vulkan GPU**, **ARM CPU**, or **Both**).
-3. Set the port (default: `50052`) and enable local caching (`-c`).
-4. Tap **START RPC SERVER**.
+3. If connecting over Wi-Fi, select **LAN / Wi-Fi (0.0.0.0)** under *Network Interface Exposure* (default is secure loopback `127.0.0.1`).
+4. Set the port (default: `50052`) and enable local caching (`-c`).
+5. Tap **START RPC SERVER**.
 
 ### 3. Connect from Windows PC Host
 
-#### Option A: Over Local Wi-Fi (Wireless)
+#### Option A: Over Local Wi-Fi (Requires LAN Mode 0.0.0.0 in app)
 ```powershell
 llama-cli.exe `
   -m "path/to/model.gguf" `

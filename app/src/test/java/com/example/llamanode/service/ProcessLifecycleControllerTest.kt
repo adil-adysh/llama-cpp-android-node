@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -19,6 +20,8 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class FakeProcess(
@@ -152,7 +155,7 @@ class ProcessLifecycleControllerTest {
         )
 
         val started = controller.start(createConfig())
-        assertTrue(started)
+        assertEquals(StartResult.STARTED, started)
 
         // Wait until RUNNING state is reached
         var retries = 0
@@ -188,7 +191,8 @@ class ProcessLifecycleControllerTest {
             onShutdownComplete = { shutdownCompleted.set(true) }
         )
 
-        controller.start(createConfig())
+        val started = controller.start(createConfig())
+        assertEquals(StartResult.STARTED, started)
         delay(100)
         assertEquals(ServerState.STARTING, controller.state)
 
@@ -217,7 +221,7 @@ class ProcessLifecycleControllerTest {
 
         controller.start(createConfig())
 
-        // Wait for readiness timeout (or trigger probe completion)
+        // Wait for readiness timeout
         var retries = 0
         while (controller.state != ServerState.ERROR && retries < 120) {
             delay(50)
@@ -225,7 +229,6 @@ class ProcessLifecycleControllerTest {
         }
 
         assertEquals(ServerState.ERROR, controller.state)
-        // CRITICAL P0-2 check: Process MUST be terminated and not left alive!
         assertTrue("Hanging process should have been destroyed on timeout", hangingProcess.wasDestroyed)
         assertFalse("Hanging process should not be alive", hangingProcess.isAlive)
         assertNull(controller.processInstance)
@@ -300,12 +303,169 @@ class ProcessLifecycleControllerTest {
         delay(50)
 
         // Simulates Android RpcServerService.onDestroy()
-        controller.destroySync(timeoutMs = 1000L)
+        controller.destroySync(timeoutMs = 800L)
 
         assertEquals(ServerState.STOPPED, controller.state)
         assertTrue(fakeProcess.wasDestroyed)
         assertFalse(fakeProcess.isAlive)
         assertNull(controller.processInstance)
         assertTrue(shutdownCompleted.get())
+    }
+
+    @Test
+    fun testStopWhileProcessLauncherBlocked() = runBlocking {
+        val launchEntered = CountDownLatch(1)
+        val unblockLauncher = CountDownLatch(1)
+        val fakeProcess = FakeProcess(alive = true, exitCode = 0)
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ ->
+                launchEntered.countDown()
+                unblockLauncher.await(5, TimeUnit.SECONDS)
+                fakeProcess
+            },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onShutdownComplete = { shutdownCompleted.set(true) }
+        )
+
+        // Start server in background
+        controller.start(createConfig())
+
+        // Wait until launcher is actively blocked
+        assertTrue(launchEntered.await(2, TimeUnit.SECONDS))
+        assertEquals(ServerState.STARTING, controller.state)
+
+        // Stop while launcher is blocked
+        val stopped = controller.stop()
+        assertTrue(stopped)
+        assertEquals(ServerState.STOPPED, controller.state)
+
+        // Unblock launcher now
+        unblockLauncher.countDown()
+
+        // Wait for coroutine to handle process return and terminate it
+        delay(300)
+
+        // CRITICAL INVARIANT: The process launched after Stop must be destroyed and not orphaned!
+        assertTrue("Process launched after stop must be destroyed", fakeProcess.wasDestroyed)
+        assertFalse(fakeProcess.isAlive)
+        assertNull(controller.processInstance)
+    }
+
+    @Test
+    fun testDestroySyncWhileProcessLauncherBlocked() = runBlocking {
+        val launchEntered = CountDownLatch(1)
+        val unblockLauncher = CountDownLatch(1)
+        val fakeProcess = FakeProcess(alive = true, exitCode = 0)
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ ->
+                launchEntered.countDown()
+                unblockLauncher.await(5, TimeUnit.SECONDS)
+                fakeProcess
+            },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onShutdownComplete = { shutdownCompleted.set(true) }
+        )
+
+        controller.start(createConfig())
+        assertTrue(launchEntered.await(2, TimeUnit.SECONDS))
+
+        // Destroy service synchronously while launcher is blocked
+        controller.destroySync(timeoutMs = 500L)
+        assertEquals(ServerState.STOPPED, controller.state)
+
+        // Unblock launcher
+        unblockLauncher.countDown()
+        delay(300)
+
+        assertTrue("Process created after destroy must be destroyed", fakeProcess.wasDestroyed)
+        assertFalse(fakeProcess.isAlive)
+        assertNull(controller.processInstance)
+    }
+
+    @Test
+    fun testDuplicateStartWhileStartingDoesNotDisrupt() = runBlocking {
+        val unblockLauncher = CountDownLatch(1)
+        val fakeProcess = FakeProcess(alive = true, exitCode = 0)
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ ->
+                unblockLauncher.await(5, TimeUnit.SECONDS)
+                fakeProcess
+            },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onShutdownComplete = { shutdownCompleted.set(true) }
+        )
+
+        val firstStart = controller.start(createConfig())
+        assertEquals(StartResult.STARTED, firstStart)
+        assertEquals(ServerState.STARTING, controller.state)
+
+        // Duplicate start while already starting
+        val secondStart = controller.start(createConfig())
+        assertEquals(StartResult.ALREADY_ACTIVE, secondStart)
+        assertEquals(ServerState.STARTING, controller.state)
+
+        // Unblock launcher and let server reach RUNNING
+        unblockLauncher.countDown()
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals(ServerState.RUNNING, controller.state)
+
+        // Duplicate start while already running
+        val thirdStart = controller.start(createConfig())
+        assertEquals(StartResult.ALREADY_ACTIVE, thirdStart)
+        assertEquals(ServerState.RUNNING, controller.state)
+
+        controller.stop()
+        assertEquals(ServerState.STOPPED, controller.state)
+    }
+
+    @Test
+    fun testServiceDestructionPreservesErrorState() = runBlocking {
+        val crashingProcess = FakeProcess(alive = false, exitCode = 1, output = "Init error\n")
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ -> crashingProcess },
+            portChecker = { _, _ -> false },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onShutdownComplete = { shutdownCompleted.set(true) }
+        )
+
+        controller.start(createConfig())
+
+        var retries = 0
+        while (controller.state != ServerState.ERROR && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals(ServerState.ERROR, controller.state)
+        assertTrue(errors.isNotEmpty())
+
+        // Simulate Android service onDestroy calling destroySync
+        controller.destroySync(timeoutMs = 500L)
+
+        // HIGH-02: State MUST remain ERROR and not be wiped to STOPPED
+        assertEquals(ServerState.ERROR, controller.state)
     }
 }

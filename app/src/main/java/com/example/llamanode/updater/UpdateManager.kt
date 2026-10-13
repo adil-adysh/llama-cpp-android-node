@@ -106,15 +106,26 @@ object UpdateManager {
             if (r < l) return false
         }
 
-        // Check run numbers if versions match (e.g. v0.2.0-b11429.r2 vs v0.2.0-b11429)
+        // Check upstream llama.cpp build numbers if major.minor.patch versions match
+        // e.g. v0.2.0-b11430 vs v0.2.0-b11429
         val remoteSuffix = remoteTag.substringAfter("-", "")
         val localSuffix = localVersion.substringAfter("-", "")
+
+        val rBuild = Regex("""b(\d+)""").find(remoteSuffix)?.groupValues?.get(1)?.toIntOrNull()
+        val lBuild = Regex("""b(\d+)""").find(localSuffix)?.groupValues?.get(1)?.toIntOrNull()
+        if (rBuild != null && lBuild != null && rBuild != lBuild) {
+            return rBuild > lBuild
+        }
+
+        // Check run numbers if upstream versions match (e.g. v0.2.0-b11429.r2 vs v0.2.0-b11429)
         if (remoteSuffix.contains(".r") && localSuffix.contains(".r")) {
             val rRun = remoteSuffix.substringAfter(".r").takeWhile { it.isDigit() }.toIntOrNull() ?: 0
             val lRun = localSuffix.substringAfter(".r").takeWhile { it.isDigit() }.toIntOrNull() ?: 0
             return rRun > lRun
         } else if (remoteSuffix.contains(".r") && !localSuffix.contains(".r")) {
             return true
+        } else if (!remoteSuffix.contains(".r") && localSuffix.contains(".r")) {
+            return false
         }
 
         return false

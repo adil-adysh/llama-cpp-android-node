@@ -24,32 +24,28 @@ fi
 
 echo "==> Using Android NDK: $NDK_PATH"
 
-SYSROOT_INCLUDE=$(find "$NDK_PATH" -type d -path "*/sysroot/usr/include" | head -n 1)
-test -d "$SYSROOT_INCLUDE" || { echo "NDK sysroot include directory not found"; exit 1; }
-
-VULKAN_HPP="$SYSROOT_INCLUDE/vulkan/vulkan.hpp"
-SPIRV_HPP="$SYSROOT_INCLUDE/spirv/unified1/spirv.hpp"
+HEADER_DIR="$PROJECT_ROOT/build/vulkan-headers"
+VULKAN_HPP="$HEADER_DIR/vulkan/vulkan.hpp"
+SPIRV_HPP="$HEADER_DIR/spirv/unified1/spirv.hpp"
 
 if [ ! -f "$VULKAN_HPP" ] || [ ! -f "$SPIRV_HPP" ]; then
-  echo "==> Setting up Vulkan & SPIR-V C++ Headers (vulkan-sdk-1.4.304.0) for Android NDK..."
+  echo "==> Setting up isolated Vulkan & SPIR-V C++ Headers (vulkan-sdk-1.4.304.0)..."
   HEADER_TMP="$PROJECT_ROOT/build/temp-headers"
   rm -rf "$HEADER_TMP"
-  mkdir -p "$HEADER_TMP"
+  mkdir -p "$HEADER_TMP" "$HEADER_DIR/vulkan" "$HEADER_DIR/spirv"
   
   if [ ! -f "$VULKAN_HPP" ]; then
     git clone --depth 1 --branch vulkan-sdk-1.4.304.0 https://github.com/KhronosGroup/Vulkan-Headers.git "$HEADER_TMP/vulkan-headers"
-    mkdir -p "$SYSROOT_INCLUDE/vulkan"
-    cp -r "$HEADER_TMP/vulkan-headers/include/vulkan/"* "$SYSROOT_INCLUDE/vulkan/"
+    cp -r "$HEADER_TMP/vulkan-headers/include/vulkan/"* "$HEADER_DIR/vulkan/"
   fi
   
   if [ ! -f "$SPIRV_HPP" ]; then
     git clone --depth 1 --branch vulkan-sdk-1.4.304.0 https://github.com/KhronosGroup/SPIRV-Headers.git "$HEADER_TMP/spirv-headers"
-    mkdir -p "$SYSROOT_INCLUDE/spirv"
-    cp -r "$HEADER_TMP/spirv-headers/include/spirv/"* "$SYSROOT_INCLUDE/spirv/"
+    cp -r "$HEADER_TMP/spirv-headers/include/spirv/"* "$HEADER_DIR/spirv/"
   fi
   
   rm -rf "$HEADER_TMP"
-  echo "==> Vulkan and SPIR-V headers successfully installed into $SYSROOT_INCLUDE"
+  echo "==> Isolated Vulkan and SPIR-V headers successfully installed into $HEADER_DIR"
 fi
 
 if [ ! -d "$UPSTREAM_DIR" ]; then
@@ -72,6 +68,8 @@ cmake -B "$BUILD_DIR" -S "$UPSTREAM_DIR" \
   -DANDROID_ABI="arm64-v8a" \
   -DANDROID_PLATFORM="android-28" \
   -DCMAKE_BUILD_TYPE="Release" \
+  -DCMAKE_INCLUDE_PATH="$HEADER_DIR" \
+  -DCMAKE_CXX_FLAGS="-I$HEADER_DIR" \
   -DBUILD_SHARED_LIBS=OFF \
   -DGGML_BACKEND_DL=OFF \
   -DGGML_NATIVE=OFF \

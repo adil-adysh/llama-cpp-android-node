@@ -1,10 +1,12 @@
 package com.example.llamanode.service
 
+import android.os.Build
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -18,6 +20,7 @@ import java.io.File
 import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.TimeUnit
 
 data class ServerConfig(
     val binaryPath: String,
@@ -31,6 +34,12 @@ data class ServerConfig(
     val nativeLibDir: String,
     val extraLdLibraryPath: String? = null
 )
+
+enum class StartResult {
+    STARTED,
+    ALREADY_ACTIVE,
+    FAILED
+}
 
 class ProcessLifecycleController(
     private val scope: CoroutineScope,
@@ -109,10 +118,10 @@ class ProcessLifecycleController(
         )
     }
 
-    suspend fun start(config: ServerConfig): Boolean = lifecycleMutex.withLock {
+    suspend fun start(config: ServerConfig): StartResult = lifecycleMutex.withLock {
         if (currentState == ServerState.STARTING || currentState == ServerState.RUNNING || currentState == ServerState.STOPPING) {
             onLog("Start request ignored; current state is $currentState")
-            return false
+            return StartResult.ALREADY_ACTIVE
         }
 
         currentState = ServerState.STARTING
@@ -129,7 +138,7 @@ class ProcessLifecycleController(
             onStateChanged(ServerState.ERROR)
             onError(errMsg)
             onShutdownComplete()
-            return false
+            return StartResult.FAILED
         }
 
         if (!config.cacheDir.exists()) {
@@ -139,7 +148,7 @@ class ProcessLifecycleController(
         activeJob = scope.launch(ioDispatcher) {
             runProcessSupervision(config)
         }
-        return true
+        return StartResult.STARTED
     }
 
     private suspend fun runProcessSupervision(config: ServerConfig) {
@@ -153,16 +162,46 @@ class ProcessLifecycleController(
             onLog("Command: ${cmd.joinToString(" ")}")
             onLog("LD_LIBRARY_PATH: ${env["LD_LIBRARY_PATH"]}")
 
-            proc = processLauncher(cmd, env, config.cacheDir)
-            currentProcess = proc
+            val launchedProc = try {
+                processLauncher(cmd, env, config.cacheDir)
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                withContext(NonCancellable) {
+                    lifecycleMutex.withLock {
+                        currentState = ServerState.ERROR
+                        onStateChanged(ServerState.ERROR)
+                        onError("Failed to launch process: ${t.message}")
+                    }
+                    onShutdownComplete()
+                }
+                return
+            }
 
-            // Verify if cancelled immediately during process creation
+            // CRITICAL-01: Guard against Stop / Cancellation during process launch
+            val shouldAbort = withContext(NonCancellable) {
+                lifecycleMutex.withLock {
+                    if (currentState != ServerState.STARTING) {
+                        onLog("Process created after state left STARTING ($currentState); terminating immediately")
+                        terminateProcessGracefully(launchedProc, 800L)
+                        true
+                    } else {
+                        proc = launchedProc
+                        currentProcess = launchedProc
+                        false
+                    }
+                }
+            }
+            if (shouldAbort) {
+                onShutdownComplete()
+                return
+            }
+
             coroutineContext.ensureActive()
 
             // Stream process output
             logJob = scope.launch(ioDispatcher) {
                 try {
-                    val reader = BufferedReader(InputStreamReader(proc.inputStream))
+                    val reader = BufferedReader(InputStreamReader(launchedProc.inputStream))
                     var line: String?
                     while (reader.readLine().also { line = it } != null) {
                         line?.let {
@@ -176,30 +215,32 @@ class ProcessLifecycleController(
             }
 
             // Probe readiness with 5s timeout
-            val isReady = probeReadiness(config.host, config.port, proc) { isReadyDetected }
+            val isReady = probeReadiness(config.host, config.port, launchedProc) { isReadyDetected }
             if (!isReady) {
                 logJob.cancel()
-                val alive = proc.isAlive
+                val alive = launchedProc.isAlive
                 val exitCode = if (!alive) {
-                    try { proc.exitValue() } catch (_: Exception) { null }
+                    try { launchedProc.exitValue() } catch (_: Exception) { null }
                 } else null
 
-                // Critical: Terminate running process if readiness timed out
+                // Terminate running process if readiness timed out
                 if (alive) {
-                    terminateProcessGracefully(proc)
+                    terminateProcessGracefully(launchedProc, 800L)
                 }
 
-                lifecycleMutex.withLock {
-                    currentProcess = null
-                    currentState = ServerState.ERROR
-                    onStateChanged(ServerState.ERROR)
-                    if (exitCode != null) {
-                        onError("Server failed to initialize and exited with code $exitCode")
-                    } else {
-                        onError("Server did not start listening on port ${config.port} within 5 seconds")
+                withContext(NonCancellable) {
+                    lifecycleMutex.withLock {
+                        currentProcess = null
+                        currentState = ServerState.ERROR
+                        onStateChanged(ServerState.ERROR)
+                        if (exitCode != null) {
+                            onError("Server failed to initialize and exited with code $exitCode")
+                        } else {
+                            onError("Server did not start listening on port ${config.port} within 5 seconds")
+                        }
                     }
+                    onShutdownComplete()
                 }
-                onShutdownComplete()
                 return
             }
 
@@ -213,51 +254,57 @@ class ProcessLifecycleController(
             }
 
             // Await process exit
-            val exitCode = withContext(ioDispatcher) { proc.waitFor() }
+            val exitCode = withContext(ioDispatcher) { launchedProc.waitFor() }
             logJob.join()
 
-            lifecycleMutex.withLock {
-                currentProcess = null
-                if (currentState == ServerState.STOPPING) {
-                    currentState = ServerState.STOPPED
-                    onStateChanged(ServerState.STOPPED)
-                    onLog("--- Server stopped cleanly ---")
-                } else if (exitCode != 0) {
-                    currentState = ServerState.ERROR
-                    onStateChanged(ServerState.ERROR)
-                    onError("Server process crashed with exit code $exitCode")
-                } else {
-                    currentState = ServerState.STOPPED
-                    onStateChanged(ServerState.STOPPED)
-                    onLog("--- Server process terminated with code 0 ---")
+            withContext(NonCancellable) {
+                lifecycleMutex.withLock {
+                    currentProcess = null
+                    if (currentState == ServerState.STOPPING) {
+                        currentState = ServerState.STOPPED
+                        onStateChanged(ServerState.STOPPED)
+                        onLog("--- Server stopped cleanly ---")
+                    } else if (exitCode != 0) {
+                        currentState = ServerState.ERROR
+                        onStateChanged(ServerState.ERROR)
+                        onError("Server process crashed with exit code $exitCode")
+                    } else {
+                        currentState = ServerState.STOPPED
+                        onStateChanged(ServerState.STOPPED)
+                        onLog("--- Server process terminated with code 0 ---")
+                    }
                 }
+                onShutdownComplete()
             }
-            onShutdownComplete()
 
         } catch (ce: CancellationException) {
             onLog("Server process supervision cancelled")
-            proc?.let { terminateProcessGracefully(it) }
+            proc?.let { terminateProcessGracefully(it, 800L) }
             logJob?.cancel()
-            lifecycleMutex.withLock {
-                currentProcess = null
-                if (currentState != ServerState.ERROR) {
-                    currentState = ServerState.STOPPED
-                    onStateChanged(ServerState.STOPPED)
+            withContext(NonCancellable) {
+                lifecycleMutex.withLock {
+                    currentProcess = null
+                    if (currentState != ServerState.ERROR) {
+                        currentState = ServerState.STOPPED
+                        onStateChanged(ServerState.STOPPED)
+                    }
                 }
+                onShutdownComplete()
             }
-            onShutdownComplete()
             throw ce
         } catch (t: Throwable) {
             onLog("Server execution exception: ${t.message}")
-            proc?.let { terminateProcessGracefully(it) }
+            proc?.let { terminateProcessGracefully(it, 800L) }
             logJob?.cancel()
-            lifecycleMutex.withLock {
-                currentProcess = null
-                currentState = ServerState.ERROR
-                onStateChanged(ServerState.ERROR)
-                onError("Server execution exception: ${t.message}")
+            withContext(NonCancellable) {
+                lifecycleMutex.withLock {
+                    currentProcess = null
+                    currentState = ServerState.ERROR
+                    onStateChanged(ServerState.ERROR)
+                    onError("Server execution exception: ${t.message}")
+                }
+                onShutdownComplete()
             }
-            onShutdownComplete()
         }
     }
 
@@ -297,14 +344,17 @@ class ProcessLifecycleController(
         currentState = ServerState.STOPPING
         onStateChanged(ServerState.STOPPING)
 
-        activeJob?.cancel()
+        val jobToCancel = activeJob
         activeJob = null
 
         val proc = currentProcess
-        if (proc != null && proc.isAlive) {
-            terminateProcessGracefully(proc)
-        }
         currentProcess = null
+
+        if (proc != null && proc.isAlive) {
+            terminateProcessGracefully(proc, 800L)
+        }
+
+        jobToCancel?.cancel()
 
         currentState = ServerState.STOPPED
         onStateChanged(ServerState.STOPPED)
@@ -312,22 +362,26 @@ class ProcessLifecycleController(
         return true
     }
 
-    fun destroySync(timeoutMs: Long = 2000L) {
+    fun destroySync(timeoutMs: Long = 800L) {
         activeJob?.cancel()
         activeJob = null
 
         val proc = currentProcess
+        currentProcess = null
+
         if (proc != null && proc.isAlive) {
             terminateProcessSync(proc, timeoutMs)
         }
-        currentProcess = null
 
-        currentState = ServerState.STOPPED
-        onStateChanged(ServerState.STOPPED)
+        // HIGH-02: Do NOT overwrite ERROR state on service destruction
+        if (currentState != ServerState.ERROR) {
+            currentState = ServerState.STOPPED
+            onStateChanged(ServerState.STOPPED)
+        }
         onShutdownComplete()
     }
 
-    suspend fun terminateProcessGracefully(proc: Process, timeoutMs: Long = 1500L) = withContext(ioDispatcher) {
+    suspend fun terminateProcessGracefully(proc: Process, timeoutMs: Long = 800L) = withContext(NonCancellable + ioDispatcher) {
         if (!proc.isAlive) {
             try { proc.waitFor() } catch (_: Exception) {}
             return@withContext
@@ -338,7 +392,7 @@ class ProcessLifecycleController(
 
         val deadline = System.currentTimeMillis() + timeoutMs
         while (proc.isAlive && System.currentTimeMillis() < deadline) {
-            delay(50)
+            delay(40)
         }
 
         if (proc.isAlive) {
@@ -347,11 +401,15 @@ class ProcessLifecycleController(
             } catch (_: Exception) {}
         }
         try {
-            proc.waitFor() // reap process exit status
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                proc.waitFor(200, TimeUnit.MILLISECONDS)
+            } else {
+                proc.waitFor()
+            }
         } catch (_: Exception) {}
     }
 
-    fun terminateProcessSync(proc: Process, timeoutMs: Long = 1500L) {
+    fun terminateProcessSync(proc: Process, timeoutMs: Long = 800L) {
         if (!proc.isAlive) {
             try { proc.waitFor() } catch (_: Exception) {}
             return
@@ -360,10 +418,11 @@ class ProcessLifecycleController(
             proc.destroy() // SIGTERM
         } catch (_: Exception) {}
 
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val gracefulTime = minOf(timeoutMs, 400L)
+        val deadline = System.currentTimeMillis() + gracefulTime
         while (proc.isAlive && System.currentTimeMillis() < deadline) {
             try {
-                Thread.sleep(50)
+                Thread.sleep(40)
             } catch (_: InterruptedException) {
                 break
             }
@@ -375,7 +434,14 @@ class ProcessLifecycleController(
             } catch (_: Exception) {}
         }
         try {
-            proc.waitFor() // reap process exit status
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                proc.waitFor(200, TimeUnit.MILLISECONDS)
+            } else {
+                val waitDeadline = System.currentTimeMillis() + 200L
+                while (proc.isAlive && System.currentTimeMillis() < waitDeadline) {
+                    Thread.sleep(20)
+                }
+            }
         } catch (_: Exception) {}
     }
 }

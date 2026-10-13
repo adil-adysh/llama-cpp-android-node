@@ -85,11 +85,18 @@ class RpcServerService : Service() {
                 startForeground(NOTIFICATION_ID, buildNotification(port))
 
                 serviceScope.launch {
-                    val started = lifecycleController.start(config)
-                    if (!started) {
-                        releaseLocks()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                    when (lifecycleController.start(config)) {
+                        StartResult.STARTED -> {
+                            // Initiated startup
+                        }
+                        StartResult.ALREADY_ACTIVE -> {
+                            // Idempotent duplicate intent: keep running!
+                        }
+                        StartResult.FAILED -> {
+                            releaseLocks()
+                            stopForeground(STOP_FOREGROUND_REMOVE)
+                            stopSelf()
+                        }
                     }
                 }
                 return START_NOT_STICKY
@@ -165,7 +172,7 @@ class RpcServerService : Service() {
     }
 
     override fun onDestroy() {
-        lifecycleController.destroySync(2000L)
+        lifecycleController.destroySync(800L)
         releaseLocks()
         serviceScope.cancel()
         super.onDestroy()

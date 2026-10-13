@@ -26,24 +26,25 @@ test -f "$TARBALL" || { echo "Error: No tarball downloaded"; exit 1; }
 TARBALL_BASENAME=$(basename "$TARBALL")
 CHECKSUMS_FILE="$TEMP_DIR/checksums.txt"
 
-if [ -f "$CHECKSUMS_FILE" ]; then
-  echo "==> Verifying SHA-256 checksum for $TARBALL_BASENAME..."
-  EXPECTED_SHA=$(grep "$TARBALL_BASENAME" "$CHECKSUMS_FILE" | awk '{print $1}' || true)
-  if [ -z "$EXPECTED_SHA" ]; then
-    echo "Error: Checksum for $TARBALL_BASENAME not found in checksums.txt"
-    exit 1
-  fi
-  ACTUAL_SHA=$(sha256sum "$TARBALL" | awk '{print $1}')
-  if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
-    echo "Error: Checksum mismatch for $TARBALL_BASENAME!"
-    echo "  Expected: $EXPECTED_SHA"
-    echo "  Actual:   $ACTUAL_SHA"
-    exit 1
-  fi
-  echo "==> Checksum verified successfully ($ACTUAL_SHA)"
-else
-  echo "Warning: checksums.txt not found in release assets."
+if [ ! -f "$CHECKSUMS_FILE" ]; then
+  echo "Error: checksums.txt not found in release assets. Cannot verify release integrity."
+  exit 1
 fi
+
+echo "==> Verifying SHA-256 checksum for $TARBALL_BASENAME..."
+EXPECTED_SHA=$(grep "$TARBALL_BASENAME" "$CHECKSUMS_FILE" | awk '{print $1}' || true)
+if [ -z "$EXPECTED_SHA" ]; then
+  echo "Error: Checksum for $TARBALL_BASENAME not found in checksums.txt"
+  exit 1
+fi
+ACTUAL_SHA=$(sha256sum "$TARBALL" | awk '{print $1}')
+if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+  echo "Error: Checksum mismatch for $TARBALL_BASENAME!"
+  echo "  Expected: $EXPECTED_SHA"
+  echo "  Actual:   $ACTUAL_SHA"
+  exit 1
+fi
+echo "==> Checksum verified successfully ($ACTUAL_SHA)"
 
 echo "Extracting $TARBALL..."
 tar -xzf "$TARBALL" -C "$TEMP_DIR"
