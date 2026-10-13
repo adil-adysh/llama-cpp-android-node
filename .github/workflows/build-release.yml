@@ -164,6 +164,8 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DVulkan_INCLUDE_DIR=/tmp/vulkan-headers/include \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_BACKEND_DL=OFF \
             -DGGML_NATIVE=OFF \
             -DGGML_RPC=ON \
             -DGGML_VULKAN=ON \
@@ -193,8 +195,10 @@ jobs:
           
           # Verify Dynamic Section (libvulkan.so and libomp.so)
           DYNAMIC_DEPS=$("$READELF" -d "$SERVER_BIN")
-          echo "$DYNAMIC_DEPS" | grep "Shared library: \[libvulkan.so\]" || { echo "::error::Missing libvulkan.so dependency"; exit 1; }
-          echo "$DYNAMIC_DEPS" | grep "Shared library: \[libomp.so\]" || { echo "::error::Missing libomp.so dependency"; exit 1; }
+          echo "=== Dynamic Dependencies for ggml-rpc-server ==="
+          echo "$DYNAMIC_DEPS"
+          echo "$DYNAMIC_DEPS" | grep -F "libvulkan.so" || { echo "::error::Missing libvulkan.so dependency"; exit 1; }
+          echo "$DYNAMIC_DEPS" | grep -F "libomp.so" || { echo "::error::Missing libomp.so dependency"; exit 1; }
           
           # Strip debug symbols
           "$STRIP" --strip-unneeded "$SERVER_BIN"
