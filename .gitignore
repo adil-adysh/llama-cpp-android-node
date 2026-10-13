@@ -11,3 +11,6 @@ app/build
 .externalNativeBuild
 .cxx
 *.apk
+/app/src/main/jniLibs/
+*.jks
+*.keystore

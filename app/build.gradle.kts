@@ -91,3 +91,20 @@ dependencies {
   implementation(libs.androidx.navigation3.runtime)
   implementation(libs.androidx.lifecycle.viewmodel.navigation3)
 }
+
+tasks.register("checkNativeLibs") {
+    doLast {
+        val serverSo = file("src/main/jniLibs/arm64-v8a/libggml-rpc-server.so")
+        if (!serverSo.exists()) {
+            throw GradleException(
+                "Native binary missing at ${serverSo.path}.\n" +
+                "Run `scripts/fetch-prebuilt-native.ps1` (or .sh) to download prebuilt binaries,\n" +
+                "or run `scripts/build-native.ps1` to compile from source with Android NDK."
+            )
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn("checkNativeLibs")
+}

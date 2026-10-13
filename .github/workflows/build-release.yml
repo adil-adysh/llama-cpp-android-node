@@ -132,23 +132,23 @@ jobs:
           fi
           
           SHORT_SHA=$(echo "$COMMIT_SHA" | cut -c1-7)
-          TAG_NAME="$RAW_RELEASE_TAG"
-          if [ -z "$TAG_NAME" ]; then
-            TAG_NAME="$RAW_LLAMA_REF"
-            if [[ ! "$TAG_NAME" =~ ^v ]]; then
-              TAG_NAME="v-${TAG_NAME}"
+          APP_VERSION="0.2.0"
+
+          if [ -n "$RAW_RELEASE_TAG" ]; then
+            TAG_NAME="$RAW_RELEASE_TAG"
+          else
+            BASE_TAG="v${APP_VERSION}-${RAW_LLAMA_REF}"
+            if git ls-remote --tags origin "refs/tags/${BASE_TAG}" | grep -q "${BASE_TAG}"; then
+              TAG_NAME="${BASE_TAG}.r${GITHUB_RUN_NUMBER}"
+              echo "Notice: Tag ${BASE_TAG} exists on remote. Using immutable tag ${TAG_NAME}"
+            else
+              TAG_NAME="${BASE_TAG}"
             fi
           fi
           
-          # Compute monotonic Android versionCode
-          NUM_PART=$(echo "$RAW_LLAMA_REF" | tr -dc '0-9')
-          if [[ "$RAW_LLAMA_REF" =~ ^[bv][0-9]+$ ]]; then
-            VERSION_CODE="${RAW_LLAMA_REF#[bv]}"
-          elif [ -n "$NUM_PART" ] && [ "${#NUM_PART}" -le 7 ] && [ "$NUM_PART" -gt 0 ] 2>/dev/null; then
-            VERSION_CODE="$NUM_PART"
-          else
-            VERSION_CODE=$((100000 + GITHUB_RUN_NUMBER))
-          fi
+          # Strictly monotonic Android versionCode independent of upstream naming
+          APP_BASE_CODE=20000
+          VERSION_CODE=$(( APP_BASE_CODE + GITHUB_RUN_NUMBER ))
           
           echo "Resolved Commit SHA: $COMMIT_SHA"
           echo "Short SHA: $SHORT_SHA"
@@ -288,16 +288,8 @@ jobs:
               --out "$TARGET_APK" "$RAW_APK"
             echo "SIGN_TYPE=Official Production Key" >> $GITHUB_ENV
           else
-            echo "Signing with persistent repository CI release keystore..."
-            FALLBACK_KEYSTORE="app/keystore/ci-release.jks"
-            test -f "$FALLBACK_KEYSTORE" || { echo "::error::Fallback keystore $FALLBACK_KEYSTORE not found in repository"; exit 1; }
-            "$APKSIGNER" sign \
-              --ks "$FALLBACK_KEYSTORE" \
-              --ks-key-alias llamarpc \
-              --ks-pass pass:android \
-              --key-pass pass:android \
-              --out "$TARGET_APK" "$RAW_APK"
-            echo "SIGN_TYPE=CI Release Key [Stable Certificate]" >> $GITHUB_ENV
+            echo "::error::SIGNING_KEYSTORE_BASE64 secret is required for signing releases."
+            exit 1
           fi
           
           echo "Verifying APK signature..."
@@ -328,6 +320,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.resolve-ref.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
           name: "llama.cpp Android Node - ${{ steps.resolve-ref.outputs.tag_name }}"
           prerelease: ${{ inputs.prerelease }}
           files: |
