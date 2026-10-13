@@ -6,12 +6,14 @@ import com.example.llamanode.util.NetworkUtils
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.io.File
 import java.util.concurrent.ConcurrentLinkedDeque
 
 enum class ServerState {
     STOPPED,
     STARTING,
     RUNNING,
+    STOPPING,
     ERROR
 }
 
@@ -33,6 +35,9 @@ object RpcServerManager {
     private val _serverState = MutableStateFlow(ServerState.STOPPED)
     val serverState: StateFlow<ServerState> = _serverState.asStateFlow()
 
+    private val _errorMessage = MutableStateFlow<String?>(null)
+    val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
+
     private val _ipAddress = MutableStateFlow("127.0.0.1")
     val ipAddress: StateFlow<String> = _ipAddress.asStateFlow()
 
@@ -42,9 +47,14 @@ object RpcServerManager {
     val networkBinding = MutableStateFlow(NetworkBinding.LOOPBACK)
     val threadCount = MutableStateFlow(0)
 
+    private val _cacheSizeBytes = MutableStateFlow(0L)
+    val cacheSizeBytes: StateFlow<Long> = _cacheSizeBytes.asStateFlow()
+
     private val logQueue = ConcurrentLinkedDeque<String>()
     private val _logs = MutableStateFlow<List<String>>(emptyList())
     val logs: StateFlow<List<String>> = _logs.asStateFlow()
+
+    fun isValidPort(p: Int): Boolean = p in 1024..65535
 
     fun refreshIp() {
         _ipAddress.value = if (networkBinding.value == NetworkBinding.LOOPBACK) {
@@ -56,6 +66,43 @@ object RpcServerManager {
 
     fun setState(state: ServerState) {
         _serverState.value = state
+        if (state != ServerState.ERROR) {
+            _errorMessage.value = null
+        }
+    }
+
+    fun setError(message: String) {
+        _errorMessage.value = message
+        _serverState.value = ServerState.ERROR
+        addLog("ERROR: $message")
+    }
+
+    fun clearError() {
+        _errorMessage.value = null
+        if (_serverState.value == ServerState.ERROR) {
+            _serverState.value = ServerState.STOPPED
+        }
+    }
+
+    fun getCacheDirectory(context: Context): File {
+        return File(context.cacheDir, "llama_rpc")
+    }
+
+    fun refreshCacheSize(context: Context) {
+        val dir = getCacheDirectory(context)
+        if (!dir.exists()) {
+            _cacheSizeBytes.value = 0L
+            return
+        }
+        val size = dir.walkTopDown().filter { it.isFile }.map { it.length() }.sum()
+        _cacheSizeBytes.value = size
+    }
+
+    fun clearCache(context: Context): Boolean {
+        val dir = getCacheDirectory(context)
+        val deleted = if (dir.exists()) dir.deleteRecursively() else true
+        refreshCacheSize(context)
+        return deleted
     }
 
     fun addLog(message: String) {
@@ -71,8 +118,20 @@ object RpcServerManager {
         _logs.value = emptyList()
     }
 
+    @Synchronized
     fun startServer(context: Context) {
-        if (_serverState.value == ServerState.RUNNING || _serverState.value == ServerState.STARTING) return
+        if (_serverState.value == ServerState.RUNNING || 
+            _serverState.value == ServerState.STARTING ||
+            _serverState.value == ServerState.STOPPING) {
+            return
+        }
+        
+        if (!isValidPort(port.value)) {
+            setError("Invalid port ${port.value}. Port must be between 1024 and 65535.")
+            return
+        }
+
+        clearError()
         refreshIp()
         val intent = Intent(context, RpcServerService::class.java).apply {
             action = RpcServerService.ACTION_START
@@ -85,7 +144,10 @@ object RpcServerManager {
         context.startForegroundService(intent)
     }
 
+    @Synchronized
     fun stopServer(context: Context) {
+        if (_serverState.value == ServerState.STOPPED) return
+        _serverState.value = ServerState.STOPPING
         val intent = Intent(context, RpcServerService::class.java).apply {
             action = RpcServerService.ACTION_STOP
         }

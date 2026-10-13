@@ -34,7 +34,7 @@ android {
     buildFeatures {
       compose = true
       aidl = false
-      buildConfig = false
+      buildConfig = true
       shaders = false
     }
 
@@ -79,6 +79,7 @@ dependencies {
   // Local tests: jUnit, coroutines, Android runner
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
+  testImplementation("org.json:json:20240303")
 
   // Instrumented tests: jUnit rules and runners
   androidTestImplementation(libs.androidx.test.core)
@@ -92,12 +93,17 @@ dependencies {
   implementation(libs.androidx.lifecycle.viewmodel.navigation3)
 }
 
-tasks.register("checkNativeLibs") {
-    doLast {
-        val serverSo = file("src/main/jniLibs/arm64-v8a/libggml-rpc-server.so")
-        if (!serverSo.exists()) {
+abstract class CheckNativeLibsTask : DefaultTask() {
+    @get:InputFile
+    @get:Optional
+    abstract val serverBinary: RegularFileProperty
+
+    @TaskAction
+    fun check() {
+        val file = serverBinary.orNull?.asFile
+        if (file == null || !file.exists()) {
             throw GradleException(
-                "Native binary missing at ${serverSo.path}.\n" +
+                "Native binary missing at src/main/jniLibs/arm64-v8a/libggml-rpc-server.so.\n" +
                 "Run `scripts/fetch-prebuilt-native.ps1` (or .sh) to download prebuilt binaries,\n" +
                 "or run `scripts/build-native.ps1` to compile from source with Android NDK."
             )
@@ -105,6 +111,11 @@ tasks.register("checkNativeLibs") {
     }
 }
 
+tasks.register<CheckNativeLibsTask>("checkNativeLibs") {
+    serverBinary.set(layout.projectDirectory.file("src/main/jniLibs/arm64-v8a/libggml-rpc-server.so"))
+}
+
 tasks.named("preBuild") {
     dependsOn("checkNativeLibs")
 }
+

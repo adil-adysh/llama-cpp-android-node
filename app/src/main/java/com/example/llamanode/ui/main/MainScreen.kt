@@ -13,6 +13,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,6 +31,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -37,16 +39,15 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -63,6 +64,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -74,8 +79,10 @@ import com.example.llamanode.service.BackendType
 import com.example.llamanode.service.NetworkBinding
 import com.example.llamanode.service.RpcServerManager
 import com.example.llamanode.service.ServerState
+import com.example.llamanode.updater.AppReleaseInfo
 import com.example.llamanode.updater.UpdateManager
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -86,33 +93,45 @@ fun MainScreen(
     val scope = rememberCoroutineScope()
 
     val serverState by RpcServerManager.serverState.collectAsStateWithLifecycle()
+    val errorMessage by RpcServerManager.errorMessage.collectAsStateWithLifecycle()
     val ipAddress by RpcServerManager.ipAddress.collectAsStateWithLifecycle()
     val port by RpcServerManager.port.collectAsStateWithLifecycle()
     val enableCache by RpcServerManager.enableCache.collectAsStateWithLifecycle()
+    val cacheSizeBytes by RpcServerManager.cacheSizeBytes.collectAsStateWithLifecycle()
     val selectedBackend by RpcServerManager.selectedBackend.collectAsStateWithLifecycle()
     val networkBinding by RpcServerManager.networkBinding.collectAsStateWithLifecycle()
     val logs by RpcServerManager.logs.collectAsStateWithLifecycle()
 
     var portInput by remember(port) { mutableStateOf(port.toString()) }
+    val isPortValid = remember(portInput) {
+        portInput.toIntOrNull()?.let { RpcServerManager.isValidPort(it) } ?: false
+    }
+
+    var autoScrollLogs by remember { mutableStateOf(true) }
+    var showLanWarningDialog by remember { mutableStateOf(false) }
+    var updateReleaseInfo by remember { mutableStateOf<AppReleaseInfo?>(null) }
     var updateStatusMessage by remember { mutableStateOf<String?>(null) }
     var isCheckingUpdates by remember { mutableStateOf(false) }
 
-    // Request notification permission on Android 13+
+    // Request notification permission on Android 13+ (non-blocking)
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
             RpcServerManager.startServer(context)
         } else {
-            Toast.makeText(context, "Notification permission required for background server", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "Notification permission denied; starting server without status bar notifications", Toast.LENGTH_LONG).show()
+            RpcServerManager.startServer(context)
         }
     }
 
     LaunchedEffect(Unit) {
         RpcServerManager.refreshIp()
+        RpcServerManager.refreshCacheSize(context)
     }
 
     fun startServerWithPermission() {
+        if (!isPortValid) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val hasPermission = ContextCompat.checkSelfPermission(
                 context,
@@ -135,6 +154,38 @@ fun MainScreen(
         Toast.makeText(context, "Copied: $label", Toast.LENGTH_SHORT).show()
     }
 
+    // LAN Exposure Warning Dialog
+    if (showLanWarningDialog) {
+        AlertDialog(
+            onDismissRequest = { showLanWarningDialog = false },
+            title = { Text("Confirm LAN Exposure (0.0.0.0)") },
+            text = {
+                Text(
+                    "SECURITY WARNING: The upstream llama.cpp RPC server has no encryption or authentication.\n\n" +
+                    "Exposing it to 0.0.0.0 allows any device on your Wi-Fi network to submit computation jobs to your phone.\n\n" +
+                    "For secure operation, use Loopback (127.0.0.1) with USB cable (ADB port forwarding) or a private VPN tunnel."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        RpcServerManager.networkBinding.value = NetworkBinding.LAN
+                        RpcServerManager.refreshIp()
+                        showLanWarningDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Expose to LAN")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showLanWarningDialog = false }) {
+                    Text("Keep Loopback")
+                }
+            }
+        )
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -149,7 +200,10 @@ fun MainScreen(
                     }
                 },
                 actions = {
-                    TextButton(onClick = { RpcServerManager.refreshIp() }) {
+                    TextButton(
+                        onClick = { RpcServerManager.refreshIp() },
+                        modifier = Modifier.semantics { contentDescription = "Refresh device IP address" }
+                    ) {
                         Text("Refresh IP")
                     }
                 },
@@ -168,6 +222,42 @@ fun MainScreen(
         ) {
             item { Spacer(modifier = Modifier.height(8.dp)) }
 
+            // Error banner if any
+            if (errorMessage != null) {
+                item {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .semantics { liveRegion = LiveRegionMode.Assertive }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Error",
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    style = MaterialTheme.typography.titleSmall
+                                )
+                                Text(
+                                    text = errorMessage.orEmpty(),
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            TextButton(onClick = { RpcServerManager.clearError() }) {
+                                Text("Dismiss", color = MaterialTheme.colorScheme.onErrorContainer)
+                            }
+                        }
+                    }
+                }
+            }
+
             // 1. Status & Control Card
             item {
                 ElevatedCard(
@@ -180,13 +270,19 @@ fun MainScreen(
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween,
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .semantics {
+                                    liveRegion = LiveRegionMode.Polite
+                                    contentDescription = "Server status: ${serverState.name} on $ipAddress:$port"
+                                }
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 val statusColor by animateColorAsState(
                                     when (serverState) {
                                         ServerState.RUNNING -> Color(0xFF4CAF50)
                                         ServerState.STARTING -> Color(0xFFFF9800)
+                                        ServerState.STOPPING -> Color(0xFFFF9800)
                                         ServerState.STOPPED -> Color(0xFF9E9E9E)
                                         ServerState.ERROR -> Color(0xFFF44336)
                                     },
@@ -224,31 +320,79 @@ fun MainScreen(
                         // Configuration Row (editable when stopped)
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
+                            verticalAlignment = Alignment.Top,
                             horizontalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             OutlinedTextField(
                                 value = portInput,
-                                onValueChange = {
-                                    portInput = it
-                                    it.toIntOrNull()?.let { p -> RpcServerManager.port.value = p }
+                                onValueChange = { input ->
+                                    portInput = input
+                                    input.toIntOrNull()?.let { p ->
+                                        if (RpcServerManager.isValidPort(p)) {
+                                            RpcServerManager.port.value = p
+                                        }
+                                    }
                                 },
                                 label = { Text("Port") },
+                                isError = !isPortValid && portInput.isNotEmpty(),
+                                supportingText = {
+                                    if (!isPortValid && portInput.isNotEmpty()) {
+                                        Text("1024..65535", color = MaterialTheme.colorScheme.error)
+                                    }
+                                },
                                 enabled = serverState == ServerState.STOPPED,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                modifier = Modifier.weight(1f)
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .semantics { contentDescription = "RPC Server Port" }
                             )
 
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.weight(1.3f)
+                            // Unified Cache Clickable Row
+                            Column(
+                                modifier = Modifier
+                                    .weight(1.3f)
+                                    .padding(top = 8.dp)
                             ) {
-                                Checkbox(
-                                    checked = enableCache,
-                                    onCheckedChange = { RpcServerManager.enableCache.value = it },
-                                    enabled = serverState == ServerState.STOPPED
-                                )
-                                Text("Cache (-c)", style = MaterialTheme.typography.bodyMedium)
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable(enabled = serverState == ServerState.STOPPED) {
+                                            RpcServerManager.enableCache.value = !enableCache
+                                        }
+                                        .semantics {
+                                            contentDescription = "Tensor Cache: ${if (enableCache) "Enabled" else "Disabled"}"
+                                        }
+                                ) {
+                                    Checkbox(
+                                        checked = enableCache,
+                                        onCheckedChange = { RpcServerManager.enableCache.value = it },
+                                        enabled = serverState == ServerState.STOPPED
+                                    )
+                                    Text("Tensor Cache (-c)", style = MaterialTheme.typography.bodyMedium)
+                                }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(start = 12.dp)
+                                ) {
+                                    Text(
+                                        text = "Size: ${formatBytes(cacheSizeBytes)}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "Clear",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier
+                                            .clickable(enabled = serverState == ServerState.STOPPED) {
+                                                RpcServerManager.clearCache(context)
+                                                Toast.makeText(context, "Cache cleared", Toast.LENGTH_SHORT).show()
+                                            }
+                                            .semantics { contentDescription = "Clear tensor cache on disk" }
+                                    )
+                                }
                             }
                         }
 
@@ -276,19 +420,22 @@ fun MainScreen(
                                 },
                                 label = { Text("Loopback (127.0.0.1 - Safe)", fontSize = 12.sp) },
                                 enabled = serverState == ServerState.STOPPED,
-                                modifier = Modifier.weight(1f)
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .semantics { contentDescription = "Bind to safe loopback interface 127.0.0.1" }
                             )
                             FilterChip(
                                 selected = networkBinding == NetworkBinding.LAN,
                                 onClick = {
                                     if (serverState == ServerState.STOPPED) {
-                                        RpcServerManager.networkBinding.value = NetworkBinding.LAN
-                                        RpcServerManager.refreshIp()
+                                        showLanWarningDialog = true
                                     }
                                 },
                                 label = { Text("LAN / Wi-Fi (0.0.0.0)", fontSize = 12.sp) },
                                 enabled = serverState == ServerState.STOPPED,
-                                modifier = Modifier.weight(1f)
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .semantics { contentDescription = "Bind to LAN interface 0.0.0.0" }
                             )
                         }
 
@@ -387,17 +534,40 @@ fun MainScreen(
                         if (serverState == ServerState.STOPPED || serverState == ServerState.ERROR) {
                             Button(
                                 onClick = { startServerWithPermission() },
-                                modifier = Modifier.fillMaxWidth(),
+                                enabled = isPortValid,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .semantics { contentDescription = "Start RPC Server" },
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = MaterialTheme.colorScheme.primary
                                 )
                             ) {
                                 Text("START RPC SERVER", fontWeight = FontWeight.Bold)
                             }
-                        } else {
+                        } else if (serverState == ServerState.STARTING) {
                             Button(
                                 onClick = { RpcServerManager.stopServer(context) },
                                 modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.tertiary
+                                )
+                            ) {
+                                Text("STARTING... (TAP TO CANCEL)", fontWeight = FontWeight.Bold)
+                            }
+                        } else if (serverState == ServerState.STOPPING) {
+                            Button(
+                                onClick = {},
+                                enabled = false,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("STOPPING SERVER...", fontWeight = FontWeight.Bold)
+                            }
+                        } else {
+                            Button(
+                                onClick = { RpcServerManager.stopServer(context) },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .semantics { contentDescription = "Stop RPC Server" },
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = MaterialTheme.colorScheme.error
                                 )
@@ -427,7 +597,7 @@ fun MainScreen(
 
                         // USB ADB Option
                         Text(
-                            "Option 1: Over USB Cable (Fastest / Lowest Latency)",
+                            "Option 1: Over USB Cable (Fastest / Recommended)",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary
@@ -435,11 +605,13 @@ fun MainScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         CodeSnippetBox(
                             code = "adb forward tcp:$port tcp:$port",
+                            label = "ADB Forward Command",
                             onCopy = { copyToClipboard("adb forward tcp:$port tcp:$port", "ADB Forward Command") }
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         CodeSnippetBox(
                             code = "llama-cli.exe -m model.gguf --rpc 127.0.0.1:$port -ngl 99",
+                            label = "USB Run Command",
                             onCopy = { copyToClipboard("llama-cli.exe -m model.gguf --rpc 127.0.0.1:$port -ngl 99", "USB Run Command") }
                         )
 
@@ -457,6 +629,7 @@ fun MainScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         CodeSnippetBox(
                             code = "llama-cli.exe -m model.gguf --rpc $ipAddress:$port -ngl 99",
+                            label = "Wi-Fi Run Command",
                             onCopy = { copyToClipboard("llama-cli.exe -m model.gguf --rpc $ipAddress:$port -ngl 99", "Wi-Fi Run Command") }
                         )
                     }
@@ -482,8 +655,32 @@ fun MainScreen(
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold
                             )
-                            Row {
-                                TextButton(onClick = { RpcServerManager.clearLogs() }) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    "Follow",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    modifier = Modifier.padding(end = 4.dp)
+                                )
+                                Switch(
+                                    checked = autoScrollLogs,
+                                    onCheckedChange = { autoScrollLogs = it },
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .semantics { contentDescription = "Auto-scroll terminal logs" }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                TextButton(
+                                    onClick = {
+                                        copyToClipboard(logs.joinToString("\n"), "All Logs")
+                                    },
+                                    modifier = Modifier.semantics { contentDescription = "Copy all console logs to clipboard" }
+                                ) {
+                                    Text("Copy")
+                                }
+                                TextButton(
+                                    onClick = { RpcServerManager.clearLogs() },
+                                    modifier = Modifier.semantics { contentDescription = "Clear console logs" }
+                                ) {
                                     Text("Clear")
                                 }
                             }
@@ -491,7 +688,7 @@ fun MainScreen(
 
                         val listState = rememberLazyListState()
                         LaunchedEffect(logs.size) {
-                            if (logs.isNotEmpty()) {
+                            if (autoScrollLogs && logs.isNotEmpty()) {
                                 listState.animateScrollToItem(logs.size - 1)
                             }
                         }
@@ -545,7 +742,7 @@ fun MainScreen(
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            "Bundled: llama.cpp ${UpdateManager.CURRENT_LLAMA_CPP_BUILD} (Qualcomm Snapdragon ARM64)",
+                            "App Version: ${UpdateManager.currentVersion} • ARM64 (Vulkan + CPU)",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -564,11 +761,12 @@ fun MainScreen(
                                         val result = UpdateManager.checkLatestRelease()
                                         isCheckingUpdates = false
                                         result.fold(
-                                            onSuccess = { tag ->
-                                                updateStatusMessage = if (tag == UpdateManager.CURRENT_LLAMA_CPP_BUILD) {
-                                                    "Up to date ($tag)"
+                                            onSuccess = { info ->
+                                                updateReleaseInfo = info
+                                                updateStatusMessage = if (info.isNewer) {
+                                                    "New release: ${info.tagName}"
                                                 } else {
-                                                    "New release available: $tag"
+                                                    "Up to date (${info.tagName})"
                                                 }
                                             },
                                             onFailure = { err ->
@@ -577,18 +775,34 @@ fun MainScreen(
                                         )
                                     }
                                 },
-                                enabled = !isCheckingUpdates
+                                enabled = !isCheckingUpdates,
+                                modifier = Modifier.semantics { contentDescription = "Check for app updates on GitHub" }
                             ) {
                                 Text("Check for Updates")
                             }
 
-                            updateStatusMessage?.let { msg ->
-                                Text(
-                                    text = msg,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
+                            updateReleaseInfo?.let { info ->
+                                if (info.isNewer && info.apkDownloadUrl != null) {
+                                    Button(
+                                        onClick = {
+                                            UpdateManager.openDownloadUrl(context, info.apkDownloadUrl)
+                                        },
+                                        modifier = Modifier.semantics { contentDescription = "Download APK update" }
+                                    ) {
+                                        Text("Download APK")
+                                    }
+                                }
                             }
+                        }
+
+                        updateStatusMessage?.let { msg ->
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = msg,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite }
+                            )
                         }
                     }
                 }
@@ -602,6 +816,7 @@ fun MainScreen(
 @Composable
 fun CodeSnippetBox(
     code: String,
+    label: String,
     onCopy: () -> Unit
 ) {
     Surface(
@@ -624,10 +839,19 @@ fun CodeSnippetBox(
             )
             IconButton(
                 onClick = onCopy,
-                modifier = Modifier.size(28.dp)
+                modifier = Modifier
+                    .size(36.dp)
+                    .semantics { contentDescription = "Copy $label" }
             ) {
                 Text("📋", fontSize = 14.sp)
             }
         }
     }
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes <= 0) return "0 B"
+    val units = arrayOf("B", "KB", "MB", "GB")
+    val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt().coerceIn(0, units.size - 1)
+    return String.format(Locale.US, "%.1f %s", bytes / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
 }
