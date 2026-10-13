@@ -71,7 +71,7 @@ jobs:
       - name: Install Host Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libvulkan-dev glslc libomp-dev ccache ninja-build
+          sudo apt-get install -y libvulkan-dev glslc spirv-headers spirv-tools glslang-tools libomp-dev ccache ninja-build
 
       - name: Resolve Canonical Upstream Commit SHA
         id: resolve-ref
@@ -139,6 +139,8 @@ jobs:
             -DANDROID_ABI=$ABI \
             -DANDROID_PLATFORM=android-$ANDROID_API \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DGGML_NATIVE=OFF \
             -DGGML_VULKAN=ON \
             -DGGML_OPENMP=ON \
