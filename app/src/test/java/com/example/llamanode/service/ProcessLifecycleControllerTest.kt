@@ -709,4 +709,278 @@ class ProcessLifecycleControllerTest {
         assertEquals("Old run must not call onShutdownComplete for newer run", 1, shutdownCount)
         assertEquals(ServerState.RUNNING, controller.state)
     }
+
+    @Test
+    fun testAutoModeVulkanSuccessDoesNotFallback() = runBlocking {
+        var activeBackend: ActiveBackendInfo? = null
+        val proc = FakeProcess(
+            alive = true,
+            exitCode = 0,
+            output = "ggml_vulkan: Found 1 Vulkan devices:\nDevices:\n  Vulkan0: Mali-G715 (11257 MiB, 11257 MiB free)\ntransport      : TCP\n"
+        )
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ -> proc },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onActiveBackendChanged = { activeBackend = it }
+        )
+
+        val res = controller.start(createConfig(backend = "AUTO"))
+        assertEquals(StartResult.STARTED, res)
+
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals(ServerState.RUNNING, controller.state)
+        assertEquals(false, controller.currentRunInstance?.isFallbackActive)
+        assertNotNull(activeBackend)
+        assertEquals(BackendType.AUTO, activeBackend?.requestedBackend)
+        assertEquals(false, activeBackend?.isFallback)
+        assertTrue(activeBackend?.activeDevices?.any { it.id == "Vulkan0" } == true)
+    }
+
+    @Test
+    fun testAutoModeVulkanInitFailureTriggersCpuFallback() = runBlocking {
+        var processLaunchCount = 0
+        var activeBackend: ActiveBackendInfo? = null
+        val proc1 = FakeProcess(
+            alive = false,
+            exitCode = 1,
+            output = "ggml_vulkan: failed to initialize Vulkan device\n"
+        )
+        val proc2 = FakeProcess(
+            alive = true,
+            exitCode = 0,
+            output = "Devices:\n  CPU: CPU (11572 MiB, 11572 MiB free)\ntransport      : TCP\n"
+        )
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { cmd, _, _ ->
+                processLaunchCount++
+                if (processLaunchCount == 1) {
+                    assertFalse("Attempt 1 in AUTO mode should not have -d CPU", cmd.contains("CPU"))
+                    proc1
+                } else {
+                    assertTrue("Attempt 2 fallback should pass -d CPU", cmd.contains("CPU"))
+                    proc2
+                }
+            },
+            portChecker = { _, _ -> processLaunchCount > 1 },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onActiveBackendChanged = { activeBackend = it }
+        )
+
+        controller.start(createConfig(backend = "AUTO"))
+
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals(2, processLaunchCount)
+        assertEquals(ServerState.RUNNING, controller.state)
+        assertEquals(true, controller.currentRunInstance?.isFallbackActive)
+        assertNotNull(activeBackend)
+        assertEquals(true, activeBackend?.isFallback)
+        assertTrue(activeBackend?.activeDevices?.any { it.id == "CPU" } == true)
+        assertTrue(logs.any { it.contains("[AUTO-FALLBACK]") })
+    }
+
+    @Test
+    fun testAutoModeUnrelatedPortConflictDoesNotFallback() = runBlocking {
+        var processLaunchCount = 0
+        val proc = FakeProcess(
+            alive = false,
+            exitCode = 1,
+            output = "bind: Address already in use\n"
+        )
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ ->
+                processLaunchCount++
+                proc
+            },
+            portChecker = { _, _ -> false },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) }
+        )
+
+        controller.start(createConfig(backend = "AUTO"))
+
+        var retries = 0
+        while (controller.state != ServerState.ERROR && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals("Must NOT launch fallback for port conflict", 1, processLaunchCount)
+        assertEquals(ServerState.ERROR, controller.state)
+        assertTrue(errors.any { it.contains("Port conflict") || it.contains("Address already in use") || it.contains("exit code 1") })
+    }
+
+    @Test
+    fun testAutoModeUnexplainedCrashDoesNotFallback() = runBlocking {
+        var processLaunchCount = 0
+        val proc = FakeProcess(
+            alive = false,
+            exitCode = 139,
+            output = "Segmentation fault\n"
+        )
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ ->
+                processLaunchCount++
+                proc
+            },
+            portChecker = { _, _ -> false },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) }
+        )
+
+        controller.start(createConfig(backend = "AUTO"))
+
+        var retries = 0
+        while (controller.state != ServerState.ERROR && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals("Must NOT launch fallback for unexplained crash without Vulkan error", 1, processLaunchCount)
+        assertEquals(ServerState.ERROR, controller.state)
+    }
+
+    @Test
+    fun testExplicitVulkanFailureDoesNotFallback() = runBlocking {
+        var processLaunchCount = 0
+        val proc = FakeProcess(
+            alive = false,
+            exitCode = 1,
+            output = "ggml_vulkan: failed to initialize Vulkan device\n"
+        )
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ ->
+                processLaunchCount++
+                proc
+            },
+            portChecker = { _, _ -> false },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) }
+        )
+
+        controller.start(createConfig(backend = "VULKAN"))
+
+        var retries = 0
+        while (controller.state != ServerState.ERROR && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals("Explicit VULKAN mode must not fallback to CPU", 1, processLaunchCount)
+        assertEquals(ServerState.ERROR, controller.state)
+    }
+
+    @Test
+    fun testAutoModeRuntimeCrashDoesNotFallback() = runBlocking {
+        var processLaunchCount = 0
+        val proc = FakeProcess(
+            alive = true,
+            exitCode = 0,
+            output = "Devices:\n  Vulkan0: Mali-G715 (11257 MiB, 11257 MiB free)\ntransport      : TCP\n"
+        )
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ ->
+                processLaunchCount++
+                proc
+            },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) }
+        )
+
+        controller.start(createConfig(backend = "AUTO"))
+
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(ServerState.RUNNING, controller.state)
+
+        // Mid-session crash: kill process with exit code 139
+        proc.kill(139)
+
+        retries = 0
+        while (controller.state != ServerState.ERROR && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals("Must NOT switch backends mid-session once RUNNING", 1, processLaunchCount)
+        assertEquals(ServerState.ERROR, controller.state)
+        assertTrue(errors.any { it.contains("crashed with SIGSEGV") })
+    }
+
+    @Test
+    fun testStartupCancellationDuringFallback() = runBlocking {
+        var processLaunchCount = 0
+        val proc1 = FakeProcess(
+            alive = false,
+            exitCode = 1,
+            output = "ggml_vulkan: failed to initialize Vulkan device\n"
+        )
+        val proc2 = FakeProcess(
+            alive = true,
+            exitCode = 0,
+            destroyExitCode = 143,
+            output = "Devices:\n  CPU: CPU (11572 MiB, 11572 MiB free)\n"
+        )
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ ->
+                processLaunchCount++
+                if (processLaunchCount == 1) proc1 else proc2
+            },
+            portChecker = { _, _ -> false },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) }
+        )
+
+        controller.start(createConfig(backend = "AUTO"))
+
+        // Wait until fallback attempt 2 is spawned
+        var retries = 0
+        while (processLaunchCount < 2 && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(2, processLaunchCount)
+
+        // Cancel during fallback
+        val stopped = controller.stop()
+        assertTrue(stopped)
+        assertEquals(ServerState.STOPPED, controller.state)
+        assertTrue("proc2 must be destroyed on cancellation", proc2.wasDestroyed)
+    }
 }

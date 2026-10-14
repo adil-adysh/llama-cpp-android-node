@@ -46,6 +46,7 @@ class RpcServerService : Service() {
             },
             onLog = { msg -> RpcServerManager.addLog(msg) },
             onError = { err -> RpcServerManager.setError(err) },
+            onActiveBackendChanged = { info -> RpcServerManager.setActiveBackendInfo(info) },
             onShutdownComplete = {
                 releaseLocks()
                 stopForeground(STOP_FOREGROUND_REMOVE)

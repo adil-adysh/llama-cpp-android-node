@@ -78,6 +78,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.llamanode.service.BackendType
 import com.example.llamanode.service.NetworkBinding
 import com.example.llamanode.service.RpcServerManager
+import com.example.llamanode.util.DeviceDiscoveryManager
+import java.io.File
 import com.example.llamanode.service.ServerState
 import com.example.llamanode.updater.AppReleaseInfo
 import com.example.llamanode.updater.UpdateManager
@@ -100,7 +102,11 @@ fun MainScreen(
     val cacheSizeBytes by RpcServerManager.cacheSizeBytes.collectAsStateWithLifecycle()
     val selectedBackend by RpcServerManager.selectedBackend.collectAsStateWithLifecycle()
     val networkBinding by RpcServerManager.networkBinding.collectAsStateWithLifecycle()
+    val hardwareCapabilities by RpcServerManager.hardwareCapabilities.collectAsStateWithLifecycle()
+    val activeBackendInfo by RpcServerManager.activeBackendInfo.collectAsStateWithLifecycle()
     val logs by RpcServerManager.logs.collectAsStateWithLifecycle()
+
+    val canConfigure = serverState == ServerState.STOPPED || serverState == ServerState.ERROR
 
     var portInput by remember(port) { mutableStateOf(port.toString()) }
     val isPortValid = remember(portInput) {
@@ -126,8 +132,12 @@ fun MainScreen(
     }
 
     LaunchedEffect(Unit) {
+        RpcServerManager.initPreferences(context)
         RpcServerManager.refreshIp()
         RpcServerManager.refreshCacheSize(context)
+        val binaryPath = File(context.applicationInfo.nativeLibraryDir, "libggml-rpc-server.so").absolutePath
+        val caps = DeviceDiscoveryManager.discoverCapabilities(context, binaryPath, context.applicationInfo.nativeLibraryDir)
+        RpcServerManager.setHardwareCapabilities(caps)
     }
 
     fun startServerWithPermission() {
@@ -315,9 +325,78 @@ fun MainScreen(
                             }
                         }
 
+                        // Active Devices & Auto Fallback Status Card
+                        AnimatedVisibility(visible = activeBackendInfo != null || serverState == ServerState.RUNNING || serverState == ServerState.STARTING) {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (activeBackendInfo?.isFallback == true) {
+                                    MaterialTheme.colorScheme.tertiaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 10.dp)
+                                    .semantics {
+                                        liveRegion = LiveRegionMode.Polite
+                                        contentDescription = if (activeBackendInfo?.isFallback == true) {
+                                            "Active backend fallback: CPU active because Vulkan initialization failed. ${activeBackendInfo?.fallbackReason.orEmpty()}"
+                                        } else {
+                                            "Active backend: ${activeBackendInfo?.activeDevices?.joinToString { "${it.id}: ${it.name}" } ?: selectedBackend.label}"
+                                        }
+                                    }
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Text(
+                                            text = if (activeBackendInfo?.isFallback == true) "⚠️ Auto Fallback Active" else "⚡ Active Devices",
+                                            fontWeight = FontWeight.Bold,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = if (activeBackendInfo?.isFallback == true) {
+                                                MaterialTheme.colorScheme.onTertiaryContainer
+                                            } else {
+                                                MaterialTheme.colorScheme.onPrimaryContainer
+                                            }
+                                        )
+                                        Text(
+                                            text = "(Requested: ${selectedBackend.label})",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    if (activeBackendInfo?.activeDevices.isNullOrEmpty()) {
+                                        Text(
+                                            text = if (serverState == ServerState.STARTING) "Initializing backend devices..." else "Ready",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    } else {
+                                        activeBackendInfo?.activeDevices?.forEach { dev ->
+                                            Text(
+                                                text = "• ${dev.id}: ${dev.name} (${dev.memoryInfo})",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontFamily = FontFamily.Monospace
+                                            )
+                                        }
+                                    }
+                                    if (activeBackendInfo?.isFallback == true && !activeBackendInfo?.fallbackReason.isNullOrBlank()) {
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            text = "Reason: ${activeBackendInfo?.fallbackReason}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        // Configuration Row (editable when stopped)
+                        // Configuration Row (editable when stopped or in error)
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.Top,
@@ -329,7 +408,7 @@ fun MainScreen(
                                     portInput = input
                                     input.toIntOrNull()?.let { p ->
                                         if (RpcServerManager.isValidPort(p)) {
-                                            RpcServerManager.port.value = p
+                                            RpcServerManager.setPort(context, p)
                                         }
                                     }
                                 },
@@ -340,7 +419,7 @@ fun MainScreen(
                                         Text("1024..65535", color = MaterialTheme.colorScheme.error)
                                     }
                                 },
-                                enabled = serverState == ServerState.STOPPED,
+                                enabled = canConfigure,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                 modifier = Modifier
                                     .weight(1f)
@@ -357,8 +436,8 @@ fun MainScreen(
                                     verticalAlignment = Alignment.CenterVertically,
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(8.dp))
-                                        .clickable(enabled = serverState == ServerState.STOPPED) {
-                                            RpcServerManager.enableCache.value = !enableCache
+                                        .clickable(enabled = canConfigure) {
+                                            RpcServerManager.setEnableCache(context, !enableCache)
                                         }
                                         .semantics {
                                             contentDescription = "Tensor Cache: ${if (enableCache) "Enabled" else "Disabled"}"
@@ -366,8 +445,8 @@ fun MainScreen(
                                 ) {
                                     Checkbox(
                                         checked = enableCache,
-                                        onCheckedChange = { RpcServerManager.enableCache.value = it },
-                                        enabled = serverState == ServerState.STOPPED
+                                        onCheckedChange = { RpcServerManager.setEnableCache(context, it) },
+                                        enabled = canConfigure
                                     )
                                     Text("Tensor Cache (-c)", style = MaterialTheme.typography.bodyMedium)
                                 }
@@ -386,7 +465,7 @@ fun MainScreen(
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.primary,
                                         modifier = Modifier
-                                            .clickable(enabled = serverState == ServerState.STOPPED) {
+                                            .clickable(enabled = canConfigure) {
                                                 scope.launch {
                                                     RpcServerManager.clearCache(context)
                                                     Toast.makeText(context, "Cache cleared", Toast.LENGTH_SHORT).show()
@@ -415,13 +494,12 @@ fun MainScreen(
                             FilterChip(
                                 selected = networkBinding == NetworkBinding.LOOPBACK,
                                 onClick = {
-                                    if (serverState == ServerState.STOPPED) {
-                                        RpcServerManager.networkBinding.value = NetworkBinding.LOOPBACK
-                                        RpcServerManager.refreshIp()
+                                    if (canConfigure) {
+                                        RpcServerManager.setNetworkBinding(context, NetworkBinding.LOOPBACK)
                                     }
                                 },
                                 label = { Text("Loopback (127.0.0.1 - Safe)", fontSize = 12.sp) },
-                                enabled = serverState == ServerState.STOPPED,
+                                enabled = canConfigure,
                                 modifier = Modifier
                                     .weight(1f)
                                     .semantics { contentDescription = "Bind to safe loopback interface 127.0.0.1" }
@@ -429,12 +507,12 @@ fun MainScreen(
                             FilterChip(
                                 selected = networkBinding == NetworkBinding.LAN,
                                 onClick = {
-                                    if (serverState == ServerState.STOPPED) {
+                                    if (canConfigure) {
                                         showLanWarningDialog = true
                                     }
                                 },
                                 label = { Text("LAN / Wi-Fi (0.0.0.0)", fontSize = 12.sp) },
-                                enabled = serverState == ServerState.STOPPED,
+                                enabled = canConfigure,
                                 modifier = Modifier
                                     .weight(1f)
                                     .semantics { contentDescription = "Bind to LAN interface 0.0.0.0" }
@@ -468,12 +546,33 @@ fun MainScreen(
                         Spacer(modifier = Modifier.height(12.dp))
 
                         // Backend Selection
-                        Text(
-                            text = "Compute Backend",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "Compute Backend",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            if (hardwareCapabilities.isDiscovered) {
+                                val gpuTitle = hardwareCapabilities.vulkanDevice?.name ?: "Vulkan GPU"
+                                Text(
+                                    text = if (hardwareCapabilities.hasVulkan) "HW: $gpuTitle + CPU" else "HW: CPU Only",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.semantics {
+                                        contentDescription = if (hardwareCapabilities.hasVulkan) {
+                                            "Detected hardware: $gpuTitle and ARM CPU"
+                                        } else {
+                                            "Detected hardware: ARM CPU only. No Vulkan GPU detected."
+                                        }
+                                    }
+                                )
+                            }
+                        }
                         Spacer(modifier = Modifier.height(6.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -482,24 +581,33 @@ fun MainScreen(
                             FilterChip(
                                 selected = selectedBackend == BackendType.AUTO,
                                 onClick = {
-                                    if (serverState == ServerState.STOPPED) {
-                                        RpcServerManager.selectedBackend.value = BackendType.AUTO
+                                    if (canConfigure) {
+                                        RpcServerManager.setBackend(context, BackendType.AUTO)
                                     }
                                 },
                                 label = { Text("Auto (GPU)", fontSize = 12.sp) },
-                                enabled = serverState == ServerState.STOPPED,
-                                modifier = Modifier.weight(1f)
+                                enabled = canConfigure,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .semantics {
+                                        contentDescription = "Select Auto backend, GPU first with automatic CPU fallback. Currently ${if (selectedBackend == BackendType.AUTO) "selected" else "not selected"}."
+                                    }
                             )
+                            val isVulkanSupported = !hardwareCapabilities.isDiscovered || hardwareCapabilities.hasVulkan
                             FilterChip(
                                 selected = selectedBackend == BackendType.VULKAN,
                                 onClick = {
-                                    if (serverState == ServerState.STOPPED) {
-                                        RpcServerManager.selectedBackend.value = BackendType.VULKAN
+                                    if (canConfigure && isVulkanSupported) {
+                                        RpcServerManager.setBackend(context, BackendType.VULKAN)
                                     }
                                 },
                                 label = { Text("Vulkan GPU", fontSize = 12.sp) },
-                                enabled = serverState == ServerState.STOPPED,
-                                modifier = Modifier.weight(1f)
+                                enabled = canConfigure && isVulkanSupported,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .semantics {
+                                        contentDescription = "Select Vulkan GPU strict backend. ${if (hardwareCapabilities.hasVulkan) hardwareCapabilities.vulkanDevice?.name.orEmpty() else ""}. Currently ${if (selectedBackend == BackendType.VULKAN) "selected" else "not selected"}."
+                                    }
                             )
                         }
                         Row(
@@ -509,24 +617,33 @@ fun MainScreen(
                             FilterChip(
                                 selected = selectedBackend == BackendType.CPU,
                                 onClick = {
-                                    if (serverState == ServerState.STOPPED) {
-                                        RpcServerManager.selectedBackend.value = BackendType.CPU
+                                    if (canConfigure) {
+                                        RpcServerManager.setBackend(context, BackendType.CPU)
                                     }
                                 },
                                 label = { Text("ARM CPU", fontSize = 12.sp) },
-                                enabled = serverState == ServerState.STOPPED,
-                                modifier = Modifier.weight(1f)
+                                enabled = canConfigure,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .semantics {
+                                        contentDescription = "Select ARM CPU strict backend. Currently ${if (selectedBackend == BackendType.CPU) "selected" else "not selected"}."
+                                    }
                             )
+                            val isBothSupported = !hardwareCapabilities.isDiscovered || hardwareCapabilities.hasVulkan
                             FilterChip(
                                 selected = selectedBackend == BackendType.BOTH,
                                 onClick = {
-                                    if (serverState == ServerState.STOPPED) {
-                                        RpcServerManager.selectedBackend.value = BackendType.BOTH
+                                    if (canConfigure && isBothSupported) {
+                                        RpcServerManager.setBackend(context, BackendType.BOTH)
                                     }
                                 },
                                 label = { Text("Vulkan + CPU", fontSize = 12.sp) },
-                                enabled = serverState == ServerState.STOPPED,
-                                modifier = Modifier.weight(1f)
+                                enabled = canConfigure && isBothSupported,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .semantics {
+                                        contentDescription = "Select Both Vulkan and CPU devices. Currently ${if (selectedBackend == BackendType.BOTH) "selected" else "not selected"}."
+                                    }
                             )
                         }
 

@@ -39,7 +39,9 @@ data class ActiveRun(
     val id: Long,
     @Volatile var process: Process? = null,
     @Volatile var stopRequested: Boolean = false,
-    @Volatile var forcedKillRequested: Boolean = false
+    @Volatile var forcedKillRequested: Boolean = false,
+    @Volatile var isFallbackActive: Boolean = false,
+    @Volatile var fallbackReason: String? = null
 )
 
 enum class StartResult {
@@ -69,6 +71,7 @@ class ProcessLifecycleController(
     private val onStateChanged: (ServerState) -> Unit = { RpcServerManager.setState(it) },
     private val onLog: (String) -> Unit = { RpcServerManager.addLog(it) },
     private val onError: (String) -> Unit = { RpcServerManager.setError(it) },
+    private val onActiveBackendChanged: (ActiveBackendInfo?) -> Unit = { RpcServerManager.setActiveBackendInfo(it) },
     private val onShutdownComplete: () -> Unit = {}
 ) {
     private val lifecycleMutex = Mutex()
@@ -82,6 +85,8 @@ class ProcessLifecycleController(
     val isRunning: Boolean get() = currentState == ServerState.RUNNING
     val processInstance: Process? get() = currentRun?.process ?: currentProcess
     val currentRunInstance: ActiveRun? get() = currentRun
+
+    private val deviceLineRegex = Regex("""^\s*(Vulkan\d*|CPU\d*):\s+([^(]+?)\s+\(([^)]+)\)""", RegexOption.IGNORE_CASE)
 
     fun buildCommandLine(config: ServerConfig): List<String> {
         val cmd = mutableListOf(
@@ -136,6 +141,7 @@ class ProcessLifecycleController(
 
         currentState = ServerState.STARTING
         onStateChanged(ServerState.STARTING)
+        onActiveBackendChanged(null)
         onLog("--- Initializing LlamaNode RPC Server on ${config.host}:${config.port} (${config.backend}) ---")
         if (config.host == "0.0.0.0") {
             onLog("SECURITY WARNING: Binding to 0.0.0.0 (LAN). Upstream RPC traffic is unauthenticated and unencrypted. Ensure you are on a trusted private network.")
@@ -164,141 +170,156 @@ class ProcessLifecycleController(
         return StartResult.STARTED
     }
 
-    private suspend fun runProcessSupervision(run: ActiveRun, config: ServerConfig) {
+    /**
+     * Determines whether a startup failure is reasonably attributable to Vulkan initialization or device availability.
+     * Port conflicts, configuration errors, and unexplained crashes return false.
+     */
+    fun isVulkanInitializationFailure(logs: List<String>, exitCode: Int?): Pair<Boolean, String?> {
+        val portConflictPatterns = listOf(
+            "address already in use",
+            "failed to bind",
+            "eaddrinuse"
+        )
+        val hasPortConflict = logs.any { line ->
+            portConflictPatterns.any { pattern -> line.contains(pattern, ignoreCase = true) }
+        }
+        if (hasPortConflict) {
+            return Pair(false, "Port conflict (Address already in use)")
+        }
+
+        val vulkanFailurePatterns = listOf(
+            "ggml_vulkan: Found 0 Vulkan devices",
+            "ggml_vulkan: 0 Vulkan devices",
+            "ggml_vulkan: failed",
+            "failed to initialize vulkan",
+            "vkcreateinstance",
+            "vkcreatedevice",
+            "vk_error",
+            "vulkan device not found",
+            "error: unknown device: vulkan",
+            "cannot find vulkan",
+            "no vulkan devices",
+            "vulkan not available",
+            "failed to create vulkan instance"
+        )
+
+        for (line in logs) {
+            for (pattern in vulkanFailurePatterns) {
+                if (line.contains(pattern, ignoreCase = true)) {
+                    return Pair(true, line.trim())
+                }
+            }
+        }
+
+        return Pair(false, null)
+    }
+
+    private suspend fun runProcessSupervision(run: ActiveRun, initialConfig: ServerConfig) {
+        var currentConfig = initialConfig
+        val isAutoMode = initialConfig.backend.equals("AUTO", ignoreCase = true)
+        var hasReachedRunning = false
+        var activeProc: Process? = null
         var logJob: Job? = null
-        var isReadyDetected = false
 
         try {
-            val cmd = buildCommandLine(config)
-            val env = buildEnvironment(config)
-            onLog("Command: ${cmd.joinToString(" ")}")
-            onLog("LD_LIBRARY_PATH: ${env["LD_LIBRARY_PATH"]}")
+            // Attempt 1 (or only attempt if not auto-fallback)
+            val launchResult1 = launchAndSuperviseAttempt(run, currentConfig, isFallback = false)
+            activeProc = launchResult1.process
+            logJob = launchResult1.logJob
 
-            val launchedProc = try {
-                processLauncher(cmd, env, config.cacheDir)
-            } catch (t: Throwable) {
-                if (t is CancellationException) throw t
-                withContext(NonCancellable) {
-                    lifecycleMutex.withLock {
-                        if (currentRun?.id == run.id) {
-                            currentState = ServerState.ERROR
-                            onStateChanged(ServerState.ERROR)
-                            onError("Failed to launch process: ${t.message}")
-                            currentRun = null
-                            currentProcess = null
-                            activeJob = null
-                            onShutdownComplete()
-                        }
-                    }
-                }
+            if (launchResult1.shouldAbort) {
+                finalizeCleanStop(run)
                 return
             }
 
-            // CRITICAL-01: Guard against Stop / Cancellation during process launch
-            val shouldAbort = withContext(NonCancellable) {
-                lifecycleMutex.withLock {
-                    if (run.stopRequested || currentState != ServerState.STARTING || currentRun?.id != run.id) {
-                        onLog("Process created after stop requested or state left STARTING ($currentState); terminating immediately")
-                        terminateProcessGracefully(launchedProc, 800L)
-                        true
-                    } else {
-                        run.process = launchedProc
-                        currentProcess = launchedProc
-                        false
-                    }
+            if (!launchResult1.isReady) {
+                logJob?.cancel()
+                val exitCode1 = launchResult1.exitCode
+                if (activeProc != null && activeProc.isAlive) {
+                    terminateProcessGracefully(activeProc, 800L)
                 }
-            }
-            if (shouldAbort) {
-                withContext(NonCancellable) {
-                    lifecycleMutex.withLock {
-                        if (currentRun?.id == run.id) {
-                            currentState = ServerState.STOPPED
-                            onStateChanged(ServerState.STOPPED)
-                            currentRun = null
-                            currentProcess = null
-                            activeJob = null
-                            onShutdownComplete()
+
+                if (run.stopRequested) {
+                    finalizeCleanStop(run)
+                    return
+                }
+
+                // Check for Auto Fallback: strictly before reaching RUNNING
+                val (isVulkanFail, failReason) = isVulkanInitializationFailure(launchResult1.capturedLogs, exitCode1)
+
+                if (isAutoMode && isVulkanFail) {
+                    onLog("[AUTO-FALLBACK] Vulkan initialization failed during startup: $failReason")
+                    onLog("[AUTO-FALLBACK] Seamlessly retrying with ARM CPU backend...")
+
+                    run.isFallbackActive = true
+                    run.fallbackReason = failReason
+
+                    // Transition config to CPU for fallback
+                    currentConfig = initialConfig.copy(backend = "CPU")
+
+                    // Attempt 2: CPU Fallback
+                    val launchResult2 = launchAndSuperviseAttempt(run, currentConfig, isFallback = true)
+                    activeProc = launchResult2.process
+                    logJob = launchResult2.logJob
+
+                    if (launchResult2.shouldAbort) {
+                        finalizeCleanStop(run)
+                        return
+                    }
+
+                    if (!launchResult2.isReady) {
+                        logJob?.cancel()
+                        val exitCode2 = launchResult2.exitCode
+                        if (activeProc != null && activeProc.isAlive) {
+                            terminateProcessGracefully(activeProc, 800L)
                         }
-                    }
-                }
-                return
-            }
 
-            coroutineContext.ensureActive()
-
-            // Stream process output
-            logJob = scope.launch(ioDispatcher) {
-                try {
-                    val reader = BufferedReader(InputStreamReader(launchedProc.inputStream))
-                    var line: String?
-                    while (reader.readLine().also { line = it } != null) {
-                        line?.let {
-                            onLog(it)
-                            if (it.contains("transport      : TCP") || it.contains("Starting RPC server")) {
-                                isReadyDetected = true
-                            }
+                        if (run.stopRequested) {
+                            finalizeCleanStop(run)
+                            return
                         }
+
+                        finalizeError(
+                            run,
+                            exitCode2,
+                            "Server failed to initialize even after CPU fallback" +
+                                if (exitCode2 != null) " (exit code $exitCode2)" else " (readiness timeout)"
+                        )
+                        return
                     }
-                } catch (_: Exception) {}
+                } else {
+                    // Non-recoverable startup error, port conflict, or explicit mode failure
+                    val errorDetail = when {
+                        failReason != null -> failReason
+                        exitCode1 != null -> "Server failed to initialize and exited with code $exitCode1"
+                        else -> "Server did not start listening on port ${currentConfig.port} within 5 seconds"
+                    }
+                    finalizeError(run, exitCode1, errorDetail)
+                    return
+                }
             }
 
-            // Probe readiness with 5s timeout
-            val isReady = probeReadiness(config.host, config.port, launchedProc) { isReadyDetected }
-            if (!isReady) {
-                logJob.cancel()
-                val alive = launchedProc.isAlive
-                val exitCode = if (!alive) {
-                    try { launchedProc.exitValue() } catch (_: Exception) { null }
-                } else null
-
-                // Terminate running process if readiness timed out
-                if (alive) {
-                    terminateProcessGracefully(launchedProc, 800L)
-                }
-
-                withContext(NonCancellable) {
-                    lifecycleMutex.withLock {
-                        if (currentRun?.id == run.id) {
-                            currentProcess = null
-                            currentRun = null
-                            activeJob = null
-
-                            if (run.stopRequested) {
-                                currentState = ServerState.STOPPED
-                                onStateChanged(ServerState.STOPPED)
-                                onLog("--- Server stopped during startup by user ---")
-                            } else {
-                                currentState = ServerState.ERROR
-                                onStateChanged(ServerState.ERROR)
-                                if (exitCode != null) {
-                                    onError("Server failed to initialize and exited with code $exitCode")
-                                } else {
-                                    onError("Server did not start listening on port ${config.port} within 5 seconds")
-                                }
-                            }
-                            onShutdownComplete()
-                        }
-                    }
-                }
-                return
-            }
-
-            // Successfully reached readiness
+            // Server reached readiness
+            hasReachedRunning = true
             lifecycleMutex.withLock {
                 if (currentRun?.id == run.id && currentState == ServerState.STARTING && !run.stopRequested) {
                     currentState = ServerState.RUNNING
                     onStateChanged(ServerState.RUNNING)
-                    onLog("--- Server is READY and listening on ${config.host}:${config.port} ---")
+                    val modeTag = if (run.isFallbackActive) "ARM CPU (Auto Fallback)" else currentConfig.backend
+                    onLog("--- Server is READY and listening on ${currentConfig.host}:${currentConfig.port} ($modeTag) ---")
                 }
             }
 
-            // Await process exit
-            val exitCode = try {
-                withContext(ioDispatcher) { launchedProc.waitFor() }
-            } catch (ce: CancellationException) {
-                try { launchedProc.waitFor() } catch (_: Exception) { launchedProc.exitValue() }
-            }
-            logJob.join()
+            // Await process exit (Once RUNNING, fallback is strictly forbidden)
+            val proc = activeProc
+            val exitCode = if (proc != null) {
+                try {
+                    withContext(ioDispatcher) { proc.waitFor() }
+                } catch (ce: CancellationException) {
+                    try { proc.waitFor() } catch (_: Exception) { proc.exitValue() }
+                }
+            } else 0
+            logJob?.join()
 
             withContext(NonCancellable) {
                 lifecycleMutex.withLock {
@@ -315,6 +336,7 @@ class ProcessLifecycleController(
                         run.stopRequested -> {
                             currentState = ServerState.STOPPED
                             onStateChanged(ServerState.STOPPED)
+                            onActiveBackendChanged(null)
                             if (run.forcedKillRequested) {
                                 onLog("--- Server stopped (forced termination) ---")
                             } else {
@@ -324,9 +346,11 @@ class ProcessLifecycleController(
                         exitCode == 0 -> {
                             currentState = ServerState.STOPPED
                             onStateChanged(ServerState.STOPPED)
+                            onActiveBackendChanged(null)
                             onLog("--- Server process terminated with code 0 ---")
                         }
                         else -> {
+                            // Runtime crash: strictly report ERROR without fallback
                             currentState = ServerState.ERROR
                             onStateChanged(ServerState.ERROR)
                             val signalMsg = when (exitCode) {
@@ -352,6 +376,7 @@ class ProcessLifecycleController(
                         currentProcess = null
                         currentRun = null
                         activeJob = null
+                        onActiveBackendChanged(null)
                         if (run.stopRequested || currentState == ServerState.STOPPING) {
                             currentState = ServerState.STOPPED
                             onStateChanged(ServerState.STOPPED)
@@ -379,12 +404,190 @@ class ProcessLifecycleController(
                         currentProcess = null
                         currentRun = null
                         activeJob = null
+                        onActiveBackendChanged(null)
                         currentState = ServerState.ERROR
                         onStateChanged(ServerState.ERROR)
                         onError("Server execution exception: ${t.message}")
                         onShutdownComplete()
                     }
                 }
+            }
+        }
+    }
+
+    private data class AttemptResult(
+        val process: Process?,
+        val logJob: Job?,
+        val isReady: Boolean,
+        val exitCode: Int?,
+        val shouldAbort: Boolean,
+        val capturedLogs: List<String>
+    )
+
+    private suspend fun launchAndSuperviseAttempt(
+        run: ActiveRun,
+        config: ServerConfig,
+        isFallback: Boolean
+    ): AttemptResult {
+        var isReadyDetected = false
+        val capturedLogs = mutableListOf<String>()
+        val detectedDevices = mutableListOf<ActiveDevice>()
+
+        val cmd = buildCommandLine(config)
+        val env = buildEnvironment(config)
+        onLog("Command: ${cmd.joinToString(" ")}")
+        onLog("LD_LIBRARY_PATH: ${env["LD_LIBRARY_PATH"]}")
+
+        val launchedProc = try {
+            processLauncher(cmd, env, config.cacheDir)
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            return AttemptResult(
+                process = null,
+                logJob = null,
+                isReady = false,
+                exitCode = null,
+                shouldAbort = false,
+                capturedLogs = capturedLogs
+            )
+        }
+
+        // Guard against Stop/Cancellation during spawn
+        val shouldAbort = withContext(NonCancellable) {
+            lifecycleMutex.withLock {
+                if (run.stopRequested || currentState != ServerState.STARTING || currentRun?.id != run.id) {
+                    onLog("Process created after stop requested or state left STARTING ($currentState); terminating immediately")
+                    terminateProcessGracefully(launchedProc, 800L)
+                    true
+                } else {
+                    run.process = launchedProc
+                    currentProcess = launchedProc
+                    false
+                }
+            }
+        }
+        if (shouldAbort) {
+            return AttemptResult(
+                process = launchedProc,
+                logJob = null,
+                isReady = false,
+                exitCode = null,
+                shouldAbort = true,
+                capturedLogs = capturedLogs
+            )
+        }
+
+        coroutineContext.ensureActive()
+
+        // Stream process output and parse active devices
+        var inDevicesSection = false
+        val logJob = scope.launch(ioDispatcher) {
+            try {
+                val reader = BufferedReader(InputStreamReader(launchedProc.inputStream))
+                var line: String?
+                while (reader.readLine().also { line = it } != null) {
+                    line?.let { rawLine ->
+                        capturedLogs.add(rawLine)
+                        onLog(rawLine)
+
+                        val trimmed = rawLine.trim()
+                        if (trimmed == "Devices:") {
+                            inDevicesSection = true
+                        } else if (inDevicesSection) {
+                            deviceLineRegex.find(trimmed)?.let { match ->
+                                val devId = match.groupValues[1].trim()
+                                val devName = match.groupValues[2].trim()
+                                val mem = match.groupValues[3].trim()
+                                detectedDevices.add(ActiveDevice(id = devId, name = devName, memoryInfo = mem))
+
+                                onActiveBackendChanged(
+                                    ActiveBackendInfo(
+                                        requestedBackend = BackendType.fromArg(config.backend),
+                                        activeDevices = detectedDevices.toList(),
+                                        isFallback = run.isFallbackActive,
+                                        fallbackReason = run.fallbackReason
+                                    )
+                                )
+                            }
+                            if (trimmed.startsWith("transport") || trimmed.contains("TCP")) {
+                                inDevicesSection = false
+                            }
+                        }
+
+                        if (rawLine.contains("transport      : TCP") || rawLine.contains("Starting RPC server")) {
+                            isReadyDetected = true
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        val isReady = probeReadiness(config.host, config.port, launchedProc) { isReadyDetected }
+        val alive = launchedProc.isAlive
+        val exitCode = if (!alive) {
+            try { launchedProc.exitValue() } catch (_: Exception) { null }
+        } else null
+
+        // If process exited, ensure reader job finishes consuming remaining buffered output
+        if (!alive) {
+            try {
+                kotlinx.coroutines.withTimeoutOrNull(300L) { logJob.join() }
+            } catch (_: Exception) {}
+        }
+
+        // If ready, ensure at least one device was recorded in active backend info
+        if (isReady && detectedDevices.isEmpty()) {
+            val fallbackDevice = if (config.backend.equals("CPU", ignoreCase = true) || isFallback) {
+                ActiveDevice("CPU", "CPU", "ARM Neon")
+            } else {
+                ActiveDevice("Vulkan0", "Vulkan GPU", "Hardware Accelerated")
+            }
+            onActiveBackendChanged(
+                ActiveBackendInfo(
+                    requestedBackend = BackendType.fromArg(config.backend),
+                    activeDevices = listOf(fallbackDevice),
+                    isFallback = run.isFallbackActive,
+                    fallbackReason = run.fallbackReason
+                )
+            )
+        }
+
+        return AttemptResult(
+            process = launchedProc,
+            logJob = logJob,
+            isReady = isReady,
+            exitCode = exitCode,
+            shouldAbort = false,
+            capturedLogs = capturedLogs
+        )
+    }
+
+    private suspend fun finalizeCleanStop(run: ActiveRun) = withContext(NonCancellable) {
+        lifecycleMutex.withLock {
+            if (currentRun?.id == run.id) {
+                currentState = ServerState.STOPPED
+                onStateChanged(ServerState.STOPPED)
+                onActiveBackendChanged(null)
+                currentRun = null
+                currentProcess = null
+                activeJob = null
+                onLog("--- Server stopped during startup by user ---")
+                onShutdownComplete()
+            }
+        }
+    }
+
+    private suspend fun finalizeError(run: ActiveRun, exitCode: Int?, errorMsg: String) = withContext(NonCancellable) {
+        lifecycleMutex.withLock {
+            if (currentRun?.id == run.id) {
+                currentProcess = null
+                currentRun = null
+                activeJob = null
+                onActiveBackendChanged(null)
+                currentState = ServerState.ERROR
+                onStateChanged(ServerState.ERROR)
+                onError(errorMsg)
+                onShutdownComplete()
             }
         }
     }
@@ -430,6 +633,7 @@ class ProcessLifecycleController(
             if (runToStop == null && activeJob == null) {
                 currentState = ServerState.STOPPED
                 onStateChanged(ServerState.STOPPED)
+                onActiveBackendChanged(null)
                 onShutdownComplete()
                 return false
             }
@@ -460,6 +664,7 @@ class ProcessLifecycleController(
                 activeJob = null
                 currentState = ServerState.STOPPED
                 onStateChanged(ServerState.STOPPED)
+                onActiveBackendChanged(null)
                 onShutdownComplete()
             }
         }
@@ -486,6 +691,7 @@ class ProcessLifecycleController(
         if (currentState != ServerState.ERROR) {
             currentState = ServerState.STOPPED
             onStateChanged(ServerState.STOPPED)
+            onActiveBackendChanged(null)
         }
         onShutdownComplete()
     }
