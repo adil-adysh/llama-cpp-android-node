@@ -20,6 +20,7 @@ import java.io.File
 import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 
 data class ServerConfig(
@@ -37,6 +38,7 @@ data class ServerConfig(
 
 data class ActiveRun(
     val id: Long,
+    val requestedBackend: String = "AUTO",
     @Volatile var process: Process? = null,
     @Volatile var stopRequested: Boolean = false,
     @Volatile var forcedKillRequested: Boolean = false,
@@ -161,7 +163,7 @@ class ProcessLifecycleController(
             config.cacheDir.mkdirs()
         }
 
-        val run = ActiveRun(id = ++runIdCounter)
+        val run = ActiveRun(id = ++runIdCounter, requestedBackend = config.backend)
         currentRun = run
 
         activeJob = scope.launch(ioDispatcher) {
@@ -430,8 +432,8 @@ class ProcessLifecycleController(
         isFallback: Boolean
     ): AttemptResult {
         var isReadyDetected = false
-        val capturedLogs = mutableListOf<String>()
-        val detectedDevices = mutableListOf<ActiveDevice>()
+        val capturedLogs = CopyOnWriteArrayList<String>()
+        val detectedDevices = CopyOnWriteArrayList<ActiveDevice>()
 
         val cmd = buildCommandLine(config)
         val env = buildEnvironment(config)
@@ -448,7 +450,7 @@ class ProcessLifecycleController(
                 isReady = false,
                 exitCode = null,
                 shouldAbort = false,
-                capturedLogs = capturedLogs
+                capturedLogs = capturedLogs.toList()
             )
         }
 
@@ -473,7 +475,7 @@ class ProcessLifecycleController(
                 isReady = false,
                 exitCode = null,
                 shouldAbort = true,
-                capturedLogs = capturedLogs
+                capturedLogs = capturedLogs.toList()
             )
         }
 
@@ -502,7 +504,8 @@ class ProcessLifecycleController(
 
                                 onActiveBackendChanged(
                                     ActiveBackendInfo(
-                                        requestedBackend = BackendType.fromArg(config.backend),
+                                        requestedBackend = BackendType.fromArg(run.requestedBackend),
+                                        effectiveBackend = BackendType.fromArg(config.backend),
                                         activeDevices = detectedDevices.toList(),
                                         isFallback = run.isFallbackActive,
                                         fallbackReason = run.fallbackReason
@@ -535,17 +538,14 @@ class ProcessLifecycleController(
             } catch (_: Exception) {}
         }
 
-        // If ready, ensure at least one device was recorded in active backend info
+        // If ready, report actual confirmed devices or empty list (unverified)
+        // Never invent or fabricate a GPU device when unconfirmed by native output
         if (isReady && detectedDevices.isEmpty()) {
-            val fallbackDevice = if (config.backend.equals("CPU", ignoreCase = true) || isFallback) {
-                ActiveDevice("CPU", "CPU", "ARM Neon")
-            } else {
-                ActiveDevice("Vulkan0", "Vulkan GPU", "Hardware Accelerated")
-            }
             onActiveBackendChanged(
                 ActiveBackendInfo(
-                    requestedBackend = BackendType.fromArg(config.backend),
-                    activeDevices = listOf(fallbackDevice),
+                    requestedBackend = BackendType.fromArg(run.requestedBackend),
+                    effectiveBackend = BackendType.fromArg(config.backend),
+                    activeDevices = emptyList(),
                     isFallback = run.isFallbackActive,
                     fallbackReason = run.fallbackReason
                 )
@@ -558,7 +558,7 @@ class ProcessLifecycleController(
             isReady = isReady,
             exitCode = exitCode,
             shouldAbort = false,
-            capturedLogs = capturedLogs
+            capturedLogs = capturedLogs.toList()
         )
     }
 

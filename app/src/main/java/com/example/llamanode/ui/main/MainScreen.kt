@@ -326,10 +326,11 @@ fun MainScreen(
                         }
 
                         // Active Devices & Auto Fallback Status Card
-                        AnimatedVisibility(visible = activeBackendInfo != null || serverState == ServerState.RUNNING || serverState == ServerState.STARTING) {
+                        val currentActiveBackend = activeBackendInfo
+                        AnimatedVisibility(visible = currentActiveBackend != null || serverState == ServerState.RUNNING || serverState == ServerState.STARTING) {
                             Surface(
                                 shape = RoundedCornerShape(8.dp),
-                                color = if (activeBackendInfo?.isFallback == true) {
+                                color = if (currentActiveBackend?.isFallback == true) {
                                     MaterialTheme.colorScheme.tertiaryContainer
                                 } else {
                                     MaterialTheme.colorScheme.primaryContainer
@@ -339,10 +340,12 @@ fun MainScreen(
                                     .padding(top = 10.dp)
                                     .semantics {
                                         liveRegion = LiveRegionMode.Polite
-                                        contentDescription = if (activeBackendInfo?.isFallback == true) {
-                                            "Active backend fallback: CPU active because Vulkan initialization failed. ${activeBackendInfo?.fallbackReason.orEmpty()}"
+                                        contentDescription = if (currentActiveBackend?.isFallback == true) {
+                                            "Active backend fallback: CPU active because Vulkan initialization failed. Effective backend: ${currentActiveBackend.effectiveBackend.label}. Reason: ${currentActiveBackend.fallbackReason.orEmpty()}"
+                                        } else if (currentActiveBackend?.activeDevices.isNullOrEmpty()) {
+                                            "Active backend: ${currentActiveBackend?.effectiveBackend?.label ?: selectedBackend.label}. Device not yet verified."
                                         } else {
-                                            "Active backend: ${activeBackendInfo?.activeDevices?.joinToString { "${it.id}: ${it.name}" } ?: selectedBackend.label}"
+                                            "Active backend: ${currentActiveBackend.effectiveBackend.label}. ${currentActiveBackend.activeDevices.joinToString { "${it.id}: ${it.name}" }}"
                                         }
                                     }
                             ) {
@@ -352,29 +355,34 @@ fun MainScreen(
                                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
                                         Text(
-                                            text = if (activeBackendInfo?.isFallback == true) "⚠️ Auto Fallback Active" else "⚡ Active Devices",
+                                            text = if (currentActiveBackend?.isFallback == true) "⚠️ Auto Fallback Active" else "⚡ Active Devices",
                                             fontWeight = FontWeight.Bold,
                                             style = MaterialTheme.typography.labelLarge,
-                                            color = if (activeBackendInfo?.isFallback == true) {
+                                            color = if (currentActiveBackend?.isFallback == true) {
                                                 MaterialTheme.colorScheme.onTertiaryContainer
                                             } else {
                                                 MaterialTheme.colorScheme.onPrimaryContainer
                                             }
                                         )
                                         Text(
-                                            text = "(Requested: ${selectedBackend.label})",
+                                            text = if (currentActiveBackend?.isFallback == true) {
+                                                "(Requested: ${currentActiveBackend.requestedBackend.label} → Effective: ${currentActiveBackend.effectiveBackend.label})"
+                                            } else {
+                                                "(Requested: ${currentActiveBackend?.requestedBackend?.label ?: selectedBackend.label})"
+                                            },
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
                                     Spacer(modifier = Modifier.height(4.dp))
-                                    if (activeBackendInfo?.activeDevices.isNullOrEmpty()) {
+                                    if (currentActiveBackend?.activeDevices.isNullOrEmpty()) {
                                         Text(
-                                            text = if (serverState == ServerState.STARTING) "Initializing backend devices..." else "Ready",
-                                            style = MaterialTheme.typography.bodySmall
+                                            text = if (serverState == ServerState.STARTING) "Initializing backend devices..." else "Device not yet verified",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     } else {
-                                        activeBackendInfo?.activeDevices?.forEach { dev ->
+                                        currentActiveBackend.activeDevices.forEach { dev ->
                                             Text(
                                                 text = "• ${dev.id}: ${dev.name} (${dev.memoryInfo})",
                                                 style = MaterialTheme.typography.bodySmall,
@@ -382,10 +390,10 @@ fun MainScreen(
                                             )
                                         }
                                     }
-                                    if (activeBackendInfo?.isFallback == true && !activeBackendInfo?.fallbackReason.isNullOrBlank()) {
+                                    if (currentActiveBackend?.isFallback == true && !currentActiveBackend.fallbackReason.isNullOrBlank()) {
                                         Spacer(modifier = Modifier.height(2.dp))
                                         Text(
-                                            text = "Reason: ${activeBackendInfo?.fallbackReason}",
+                                            text = "Reason: ${currentActiveBackend.fallbackReason}",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.error
                                         )

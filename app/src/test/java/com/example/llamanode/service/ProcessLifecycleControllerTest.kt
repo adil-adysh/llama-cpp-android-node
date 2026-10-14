@@ -741,6 +741,7 @@ class ProcessLifecycleControllerTest {
         assertEquals(false, controller.currentRunInstance?.isFallbackActive)
         assertNotNull(activeBackend)
         assertEquals(BackendType.AUTO, activeBackend?.requestedBackend)
+        assertEquals(BackendType.AUTO, activeBackend?.effectiveBackend)
         assertEquals(false, activeBackend?.isFallback)
         assertTrue(activeBackend?.activeDevices?.any { it.id == "Vulkan0" } == true)
     }
@@ -791,6 +792,8 @@ class ProcessLifecycleControllerTest {
         assertEquals(ServerState.RUNNING, controller.state)
         assertEquals(true, controller.currentRunInstance?.isFallbackActive)
         assertNotNull(activeBackend)
+        assertEquals(BackendType.AUTO, activeBackend?.requestedBackend)
+        assertEquals(BackendType.CPU, activeBackend?.effectiveBackend)
         assertEquals(true, activeBackend?.isFallback)
         assertTrue(activeBackend?.activeDevices?.any { it.id == "CPU" } == true)
         assertTrue(logs.any { it.contains("[AUTO-FALLBACK]") })
@@ -982,5 +985,155 @@ class ProcessLifecycleControllerTest {
         assertTrue(stopped)
         assertEquals(ServerState.STOPPED, controller.state)
         assertTrue("proc2 must be destroyed on cancellation", proc2.wasDestroyed)
+    }
+
+    @Test
+    fun testAutoModeNoDeviceLogsReportsUnverifiedWithoutInventingGpu() = runBlocking {
+        var activeBackend: ActiveBackendInfo? = null
+        val proc = FakeProcess(
+            alive = true,
+            exitCode = 0,
+            output = "Starting RPC server\ntransport      : TCP\n"
+        )
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ -> proc },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onActiveBackendChanged = { activeBackend = it }
+        )
+
+        val res = controller.start(createConfig(backend = "AUTO"))
+        assertEquals(StartResult.STARTED, res)
+
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals(ServerState.RUNNING, controller.state)
+        assertNotNull(activeBackend)
+        assertEquals(BackendType.AUTO, activeBackend?.requestedBackend)
+        assertEquals(BackendType.AUTO, activeBackend?.effectiveBackend)
+        assertTrue("activeDevices must be empty when no device log is parsed, never inventing Vulkan0",
+            activeBackend?.activeDevices?.isEmpty() == true)
+        assertFalse(activeBackend?.isFallback == true)
+    }
+
+    @Test
+    fun testAutoModeCpuOnlyDeviceReportsCpu() = runBlocking {
+        var activeBackend: ActiveBackendInfo? = null
+        val proc = FakeProcess(
+            alive = true,
+            exitCode = 0,
+            output = "Devices:\n  CPU: CPU (11572 MiB, 11572 MiB free)\ntransport      : TCP\n"
+        )
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ -> proc },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onActiveBackendChanged = { activeBackend = it }
+        )
+
+        val res = controller.start(createConfig(backend = "AUTO"))
+        assertEquals(StartResult.STARTED, res)
+
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals(ServerState.RUNNING, controller.state)
+        assertNotNull(activeBackend)
+        assertEquals(BackendType.AUTO, activeBackend?.requestedBackend)
+        assertEquals(BackendType.AUTO, activeBackend?.effectiveBackend)
+        assertEquals(1, activeBackend?.activeDevices?.size)
+        assertEquals("CPU", activeBackend?.activeDevices?.first()?.id)
+        assertFalse("Native CPU selection in AUTO mode without Vulkan failure is not fallback", activeBackend?.isFallback == true)
+    }
+
+    @Test
+    fun testThreadSafeLogCollectionUnderConcurrentStream() = runBlocking {
+        val pipedOut = java.io.PipedOutputStream()
+        val pipedIn = java.io.PipedInputStream(pipedOut)
+        val writerAlive = java.util.concurrent.atomic.AtomicBoolean(true)
+
+        val writerThread = Thread {
+            val writer = java.io.BufferedWriter(java.io.OutputStreamWriter(pipedOut))
+            var counter = 0
+            try {
+                writer.write("Starting RPC server\n")
+                writer.write("transport      : TCP\n")
+                writer.flush()
+                while (writerAlive.get()) {
+                    writer.write("Log line ${counter++}\n")
+                    writer.flush()
+                    Thread.sleep(1)
+                }
+            } catch (_: Exception) {}
+        }
+        writerThread.start()
+
+        val streamingProc = object : Process() {
+            private var alive = true
+            override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+            override fun getInputStream(): InputStream = pipedIn
+            override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+            override fun waitFor(): Int {
+                while (alive) {
+                    Thread.sleep(10)
+                }
+                return 0
+            }
+            override fun exitValue(): Int {
+                if (alive) throw IllegalThreadStateException("Process alive")
+                return 0
+            }
+            override fun destroy() {
+                alive = false
+                writerAlive.set(false)
+                try { pipedOut.close() } catch (_: Exception) {}
+            }
+            override fun destroyForcibly(): Process {
+                destroy()
+                return this
+            }
+        }
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ -> streamingProc },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) }
+        )
+
+        controller.start(createConfig(backend = "AUTO"))
+
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(ServerState.RUNNING, controller.state)
+
+        for (i in 0 until 50) {
+            val logSnapshot = logs.toList()
+            assertTrue(logSnapshot.isNotEmpty())
+            delay(5)
+        }
+
+        controller.stop()
+        writerAlive.set(false)
+        try { pipedOut.close() } catch (_: Exception) {}
+        writerThread.join(1000)
     }
 }

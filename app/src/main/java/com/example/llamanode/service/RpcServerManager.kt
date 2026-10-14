@@ -46,6 +46,7 @@ data class ActiveDevice(
 
 data class ActiveBackendInfo(
     val requestedBackend: BackendType,
+    val effectiveBackend: BackendType = requestedBackend,
     val activeDevices: List<ActiveDevice>,
     val isFallback: Boolean = false,
     val fallbackReason: String? = null

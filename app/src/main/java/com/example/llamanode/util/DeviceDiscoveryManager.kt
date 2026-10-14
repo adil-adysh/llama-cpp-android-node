@@ -4,11 +4,14 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 
 data class DiscoveredDevice(
@@ -34,50 +37,81 @@ object DeviceDiscoveryManager {
     suspend fun discoverCapabilities(
         context: Context,
         binaryPath: String,
-        nativeLibDir: String
+        nativeLibDir: String,
+        timeoutMs: Long = 2500L,
+        processLauncher: (cmd: List<String>, env: Map<String, String>) -> Process = { cmd, env ->
+            val pb = ProcessBuilder(cmd).redirectErrorStream(true)
+            pb.environment().putAll(env)
+            pb.start()
+        }
     ): HardwareCapabilities = withContext(Dispatchers.IO) {
         val binaryFile = File(binaryPath)
         if (!binaryFile.exists() || !binaryFile.canExecute()) {
             return@withContext getPackageManagerFallback(context)
         }
 
-        val discovered = withTimeoutOrNull(2500L) {
-            probeNativeBinary(binaryFile, nativeLibDir)
-        }
-
+        val discovered = probeNativeBinaryWithTimeout(binaryFile, nativeLibDir, timeoutMs, processLauncher)
         discovered ?: getPackageManagerFallback(context)
     }
 
-    private fun probeNativeBinary(binaryFile: File, nativeLibDir: String): HardwareCapabilities? {
+    suspend fun probeNativeBinaryWithTimeout(
+        binaryFile: File,
+        nativeLibDir: String,
+        timeoutMs: Long,
+        processLauncher: (cmd: List<String>, env: Map<String, String>) -> Process
+    ): HardwareCapabilities? = withContext(Dispatchers.IO) {
         var proc: Process? = null
+        val lines = CopyOnWriteArrayList<String>()
+        var readerJob: Job? = null
+
         try {
             val cmd = listOf(binaryFile.absolutePath, "-d", "__probe_discovery__")
             val ldLibPath = "$nativeLibDir:/system/lib64:/vendor/lib64"
-            val pb = ProcessBuilder(cmd).redirectErrorStream(true)
-            pb.environment()["LD_LIBRARY_PATH"] = ldLibPath
+            val env = mapOf("LD_LIBRARY_PATH" to ldLibPath)
 
-            proc = pb.start()
-            val reader = BufferedReader(InputStreamReader(proc.inputStream))
-            val lines = mutableListOf<String>()
-            var line: String?
+            proc = processLauncher(cmd, env)
+            val currentProc = proc
 
-            while (reader.readLine().also { line = it } != null) {
-                line?.let { lines.add(it) }
+            readerJob = launch(Dispatchers.IO) {
+                try {
+                    val reader = BufferedReader(InputStreamReader(currentProc.inputStream))
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        line?.let { lines.add(it) }
+                    }
+                } catch (_: Exception) {}
             }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                proc.waitFor(1000L, TimeUnit.MILLISECONDS)
+            val completedInTime = withTimeoutOrNull(timeoutMs) {
+                readerJob.join()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    currentProc.waitFor(500L, TimeUnit.MILLISECONDS)
+                } else {
+                    currentProc.waitFor()
+                }
+                true
+            }
+
+            if (completedInTime == true) {
+                parseProbeOutput(lines.toList())
             } else {
-                proc.waitFor()
+                null
             }
-
-            return parseProbeOutput(lines)
         } catch (_: Exception) {
-            return null
+            null
         } finally {
-            try {
-                proc?.destroyForcibly()
-            } catch (_: Exception) {}
+            readerJob?.cancel()
+            proc?.let { p ->
+                try { p.inputStream.close() } catch (_: Exception) {}
+                try { p.errorStream.close() } catch (_: Exception) {}
+                try { p.outputStream.close() } catch (_: Exception) {}
+                try {
+                    p.destroyForcibly()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        p.waitFor(200L, TimeUnit.MILLISECONDS)
+                    }
+                } catch (_: Exception) {}
+            }
         }
     }
 
