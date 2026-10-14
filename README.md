@@ -85,15 +85,32 @@ llama-cli.exe `
 
 ## Verified Device Performance
 
-Tested with `SmolLM2-135M-Instruct-Q4_K_M.gguf` offloading 100% of layers (`-ngl 99`):
+All benchmarks measured over RPC using official release [`v0.2.0-b11429.r14`](https://github.com/adil-adysh/llama-cpp-android-node/releases/tag/v0.2.0-b11429.r14) and upstream Windows `llama-cli.exe` (b11429) offloading 100% of layers (`-ngl 99`) with tensor caching enabled (`-c`).
 
-| Device | Chipset | Backend | Prompt Speed | Generation Speed |
-| :--- | :--- | :--- | :--- | :--- |
-| **Pixel 8 Pro** | Tensor G3 (Mali-G715) | Vulkan GPU | 24.6 t/s | 8.1 t/s |
-| **Pixel 8 Pro** | Tensor G3 (ARMv9) | CPU (OpenMP) | 58.2 t/s | 10.6 t/s |
-| **Pixel 8 Pro (USB)** | Tensor G3 | CPU (ADB Forward) | **165.7 t/s** | **31.6 t/s** |
-| **Galaxy S25** | Snapdragon 8 Elite | CPU / Wi-Fi | **131.5 t/s** | **16.6 t/s** |
-| **Cluster (Dual Phone)** | Pixel 8 Pro + S25 | Distributed Wi-Fi | 38.9 t/s | 6.4 t/s |
+### 1. Production Model: `Llama-3.2-1B-Instruct-Q4_K_M.gguf` (~800 MB)
+
+| Device / Setup | Connection | Processor / Chipset | Backend | Prompt Processing (PP) | Text Generation (TG) | Notes |
+| :--- | :--- | :--- | :--- | :---: | :---: | :--- |
+| **Pixel 8 Pro** | USB (ADB) | Tensor G3 (Mali-G715) | **Vulkan GPU** | **45.2 t/s** | **12.3 t/s** | Dedicated GPU tensor offload |
+| **Galaxy S25** | USB (ADB) | Snapdragon 8 Elite | **ARM CPU (Oryon)** | **38.9 t/s** | **18.9 t/s** | 8-core Oryon CPU with OpenMP |
+| **Cluster (Dual Phone)** | USB (ADB) | Pixel 8 Pro + Galaxy S25 | **Distributed (Vulkan + CPU)** | **31.7 t/s** | **11.1 t/s** | Layers sharded across both phones (`--rpc 127.0.0.1:50052,127.0.0.1:50053`) |
+
+> **Note on Backends:**
+> - **Qualcomm Oryon CPU**: The Snapdragon 8 Elite delivers exceptional single/multi-thread throughput (**18.9 TG t/s**), making `ARM CPU` the top-performing backend on Galaxy S25. (Adreno 830 Vulkan currently hits an upstream driver SPIR-V compiler issue on Android 17 with Q4_K quantizations).
+> - **Mali-G715 GPU**: The Google Tensor G3 provides steady GPU acceleration on Vulkan (**12.3 TG t/s**), offloading compute from the host CPU.
+
+---
+
+### 2. Lightweight Model: `SmolLM2-135M-Instruct-Q4_K_M.gguf` (135 MB)
+
+| Device / Setup | Connection | Processor / Chipset | Backend | Prompt Processing (PP) | Text Generation (TG) |
+| :--- | :--- | :--- | :--- | :---: | :---: |
+| **Pixel 8 Pro** | USB (ADB) | Tensor G3 (Mali-G715) | **Vulkan GPU** | **52.0 t/s** | **24.1 t/s** |
+| **Pixel 8 Pro** | USB (ADB) | Tensor G3 (ARMv9) | **ARM CPU (OpenMP)** | **165.7 t/s** | **31.6 t/s** |
+| **Pixel 8 Pro** | Wi-Fi (LAN) | Tensor G3 (ARMv9) | **ARM CPU (OpenMP)** | **58.2 t/s** | **10.6 t/s** |
+| **Galaxy S25** | Wi-Fi (LAN) | Snapdragon 8 Elite | **ARM CPU (OpenMP)** | **131.5 t/s** | **16.6 t/s** |
+| **Cluster (Dual Phone)** | Wi-Fi (LAN) | Pixel 8 Pro + S25 | **Distributed Wi-Fi** | **38.9 t/s** | **6.4 t/s** |
+
 
 ---
 
