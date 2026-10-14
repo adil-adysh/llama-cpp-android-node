@@ -35,6 +35,13 @@ data class ServerConfig(
     val extraLdLibraryPath: String? = null
 )
 
+data class ActiveRun(
+    val id: Long,
+    @Volatile var process: Process? = null,
+    @Volatile var stopRequested: Boolean = false,
+    @Volatile var forcedKillRequested: Boolean = false
+)
+
 enum class StartResult {
     STARTED,
     ALREADY_ACTIVE,
@@ -66,12 +73,15 @@ class ProcessLifecycleController(
 ) {
     private val lifecycleMutex = Mutex()
     private var activeJob: Job? = null
+    private var runIdCounter: Long = 0L
+    @Volatile private var currentRun: ActiveRun? = null
     @Volatile private var currentProcess: Process? = null
     @Volatile private var currentState: ServerState = ServerState.STOPPED
 
     val state: ServerState get() = currentState
     val isRunning: Boolean get() = currentState == ServerState.RUNNING
-    val processInstance: Process? get() = currentProcess
+    val processInstance: Process? get() = currentRun?.process ?: currentProcess
+    val currentRunInstance: ActiveRun? get() = currentRun
 
     fun buildCommandLine(config: ServerConfig): List<String> {
         val cmd = mutableListOf(
@@ -145,14 +155,16 @@ class ProcessLifecycleController(
             config.cacheDir.mkdirs()
         }
 
+        val run = ActiveRun(id = ++runIdCounter)
+        currentRun = run
+
         activeJob = scope.launch(ioDispatcher) {
-            runProcessSupervision(config)
+            runProcessSupervision(run, config)
         }
         return StartResult.STARTED
     }
 
-    private suspend fun runProcessSupervision(config: ServerConfig) {
-        var proc: Process? = null
+    private suspend fun runProcessSupervision(run: ActiveRun, config: ServerConfig) {
         var logJob: Job? = null
         var isReadyDetected = false
 
@@ -168,11 +180,16 @@ class ProcessLifecycleController(
                 if (t is CancellationException) throw t
                 withContext(NonCancellable) {
                     lifecycleMutex.withLock {
-                        currentState = ServerState.ERROR
-                        onStateChanged(ServerState.ERROR)
-                        onError("Failed to launch process: ${t.message}")
+                        if (currentRun?.id == run.id) {
+                            currentState = ServerState.ERROR
+                            onStateChanged(ServerState.ERROR)
+                            onError("Failed to launch process: ${t.message}")
+                            currentRun = null
+                            currentProcess = null
+                            activeJob = null
+                            onShutdownComplete()
+                        }
                     }
-                    onShutdownComplete()
                 }
                 return
             }
@@ -180,19 +197,30 @@ class ProcessLifecycleController(
             // CRITICAL-01: Guard against Stop / Cancellation during process launch
             val shouldAbort = withContext(NonCancellable) {
                 lifecycleMutex.withLock {
-                    if (currentState != ServerState.STARTING) {
-                        onLog("Process created after state left STARTING ($currentState); terminating immediately")
+                    if (run.stopRequested || currentState != ServerState.STARTING || currentRun?.id != run.id) {
+                        onLog("Process created after stop requested or state left STARTING ($currentState); terminating immediately")
                         terminateProcessGracefully(launchedProc, 800L)
                         true
                     } else {
-                        proc = launchedProc
+                        run.process = launchedProc
                         currentProcess = launchedProc
                         false
                     }
                 }
             }
             if (shouldAbort) {
-                onShutdownComplete()
+                withContext(NonCancellable) {
+                    lifecycleMutex.withLock {
+                        if (currentRun?.id == run.id) {
+                            currentState = ServerState.STOPPED
+                            onStateChanged(ServerState.STOPPED)
+                            currentRun = null
+                            currentProcess = null
+                            activeJob = null
+                            onShutdownComplete()
+                        }
+                    }
+                }
                 return
             }
 
@@ -230,23 +258,34 @@ class ProcessLifecycleController(
 
                 withContext(NonCancellable) {
                     lifecycleMutex.withLock {
-                        currentProcess = null
-                        currentState = ServerState.ERROR
-                        onStateChanged(ServerState.ERROR)
-                        if (exitCode != null) {
-                            onError("Server failed to initialize and exited with code $exitCode")
-                        } else {
-                            onError("Server did not start listening on port ${config.port} within 5 seconds")
+                        if (currentRun?.id == run.id) {
+                            currentProcess = null
+                            currentRun = null
+                            activeJob = null
+
+                            if (run.stopRequested) {
+                                currentState = ServerState.STOPPED
+                                onStateChanged(ServerState.STOPPED)
+                                onLog("--- Server stopped during startup by user ---")
+                            } else {
+                                currentState = ServerState.ERROR
+                                onStateChanged(ServerState.ERROR)
+                                if (exitCode != null) {
+                                    onError("Server failed to initialize and exited with code $exitCode")
+                                } else {
+                                    onError("Server did not start listening on port ${config.port} within 5 seconds")
+                                }
+                            }
+                            onShutdownComplete()
                         }
                     }
-                    onShutdownComplete()
                 }
                 return
             }
 
             // Successfully reached readiness
             lifecycleMutex.withLock {
-                if (currentState == ServerState.STARTING) {
+                if (currentRun?.id == run.id && currentState == ServerState.STARTING && !run.stopRequested) {
                     currentState = ServerState.RUNNING
                     onStateChanged(ServerState.RUNNING)
                     onLog("--- Server is READY and listening on ${config.host}:${config.port} ---")
@@ -254,56 +293,98 @@ class ProcessLifecycleController(
             }
 
             // Await process exit
-            val exitCode = withContext(ioDispatcher) { launchedProc.waitFor() }
+            val exitCode = try {
+                withContext(ioDispatcher) { launchedProc.waitFor() }
+            } catch (ce: CancellationException) {
+                try { launchedProc.waitFor() } catch (_: Exception) { launchedProc.exitValue() }
+            }
             logJob.join()
 
             withContext(NonCancellable) {
                 lifecycleMutex.withLock {
-                    currentProcess = null
-                    if (currentState == ServerState.STOPPING) {
-                        currentState = ServerState.STOPPED
-                        onStateChanged(ServerState.STOPPED)
-                        onLog("--- Server stopped cleanly ---")
-                    } else if (exitCode != 0) {
-                        currentState = ServerState.ERROR
-                        onStateChanged(ServerState.ERROR)
-                        onError("Server process crashed with exit code $exitCode")
-                    } else {
-                        currentState = ServerState.STOPPED
-                        onStateChanged(ServerState.STOPPED)
-                        onLog("--- Server process terminated with code 0 ---")
+                    if (currentRun?.id != run.id) {
+                        onLog("Process run #${run.id} finished after newer run #${currentRun?.id} started; ignoring state change")
+                        return@withLock
                     }
+
+                    currentProcess = null
+                    currentRun = null
+                    activeJob = null
+
+                    when {
+                        run.stopRequested -> {
+                            currentState = ServerState.STOPPED
+                            onStateChanged(ServerState.STOPPED)
+                            if (run.forcedKillRequested) {
+                                onLog("--- Server stopped (forced termination) ---")
+                            } else {
+                                onLog("--- Server stopped cleanly by user ---")
+                            }
+                        }
+                        exitCode == 0 -> {
+                            currentState = ServerState.STOPPED
+                            onStateChanged(ServerState.STOPPED)
+                            onLog("--- Server process terminated with code 0 ---")
+                        }
+                        else -> {
+                            currentState = ServerState.ERROR
+                            onStateChanged(ServerState.ERROR)
+                            val signalMsg = when (exitCode) {
+                                143 -> "terminated by unexpected SIGTERM (exit code 143)"
+                                137 -> "killed by unexpected SIGKILL/OOM (exit code 137)"
+                                139 -> "crashed with SIGSEGV (exit code 139)"
+                                else -> "crashed with exit code $exitCode"
+                            }
+                            onError("Server process $signalMsg")
+                        }
+                    }
+                    onShutdownComplete()
                 }
-                onShutdownComplete()
             }
 
         } catch (ce: CancellationException) {
-            onLog("Server process supervision cancelled")
-            proc?.let { terminateProcessGracefully(it, 800L) }
+            onLog("Server process supervision cancelled (run #${run.id})")
+            run.process?.let { terminateProcessGracefully(it, 800L) }
             logJob?.cancel()
             withContext(NonCancellable) {
                 lifecycleMutex.withLock {
-                    currentProcess = null
-                    if (currentState != ServerState.ERROR) {
-                        currentState = ServerState.STOPPED
-                        onStateChanged(ServerState.STOPPED)
+                    if (currentRun?.id == run.id) {
+                        currentProcess = null
+                        currentRun = null
+                        activeJob = null
+                        if (run.stopRequested || currentState == ServerState.STOPPING) {
+                            currentState = ServerState.STOPPED
+                            onStateChanged(ServerState.STOPPED)
+                            if (run.forcedKillRequested) {
+                                onLog("--- Server stopped (forced termination) ---")
+                            } else {
+                                onLog("--- Server stopped cleanly by user ---")
+                            }
+                        } else if (currentState != ServerState.ERROR) {
+                            currentState = ServerState.STOPPED
+                            onStateChanged(ServerState.STOPPED)
+                        }
+                        onShutdownComplete()
                     }
                 }
-                onShutdownComplete()
             }
             throw ce
         } catch (t: Throwable) {
-            onLog("Server execution exception: ${t.message}")
-            proc?.let { terminateProcessGracefully(it, 800L) }
+            onLog("Server execution exception (run #${run.id}): ${t.message}")
+            run.process?.let { terminateProcessGracefully(it, 800L) }
             logJob?.cancel()
             withContext(NonCancellable) {
                 lifecycleMutex.withLock {
-                    currentProcess = null
-                    currentState = ServerState.ERROR
-                    onStateChanged(ServerState.ERROR)
-                    onError("Server execution exception: ${t.message}")
+                    if (currentRun?.id == run.id) {
+                        currentProcess = null
+                        currentRun = null
+                        activeJob = null
+                        currentState = ServerState.ERROR
+                        onStateChanged(ServerState.ERROR)
+                        onError("Server execution exception: ${t.message}")
+                        onShutdownComplete()
+                    }
                 }
-                onShutdownComplete()
             }
         }
     }
@@ -335,39 +416,67 @@ class ProcessLifecycleController(
         return@withContext false
     }
 
-    suspend fun stop(): Boolean = lifecycleMutex.withLock {
-        if (currentState == ServerState.STOPPED) {
-            return false
+    suspend fun stop(): Boolean {
+        val runToStop: ActiveRun?
+        val jobToCancel: Job?
+        val procToTerminate: Process?
+
+        lifecycleMutex.withLock {
+            if (currentState == ServerState.STOPPED) {
+                return false
+            }
+
+            runToStop = currentRun
+            if (runToStop == null && activeJob == null) {
+                currentState = ServerState.STOPPED
+                onStateChanged(ServerState.STOPPED)
+                onShutdownComplete()
+                return false
+            }
+
+            onLog("Initiating graceful shutdown...")
+            currentState = ServerState.STOPPING
+            onStateChanged(ServerState.STOPPING)
+
+            runToStop?.stopRequested = true
+            procToTerminate = runToStop?.process ?: currentProcess
+            jobToCancel = activeJob
         }
 
-        onLog("Initiating graceful shutdown...")
-        currentState = ServerState.STOPPING
-        onStateChanged(ServerState.STOPPING)
-
-        val jobToCancel = activeJob
-        activeJob = null
-
-        val proc = currentProcess
-        currentProcess = null
-
-        if (proc != null && proc.isAlive) {
-            terminateProcessGracefully(proc, 800L)
+        // Terminate process outside of lifecycleMutex to prevent deadlock with supervisor
+        if (procToTerminate != null && procToTerminate.isAlive) {
+            terminateProcessGracefully(procToTerminate, 800L)
         }
 
         jobToCancel?.cancel()
+        try {
+            jobToCancel?.join()
+        } catch (_: Exception) {}
 
-        currentState = ServerState.STOPPED
-        onStateChanged(ServerState.STOPPED)
-        onShutdownComplete()
+        lifecycleMutex.withLock {
+            if (currentRun == runToStop && (currentState == ServerState.STOPPING || currentState != ServerState.ERROR && currentState != ServerState.STOPPED)) {
+                currentProcess = null
+                currentRun = null
+                activeJob = null
+                currentState = ServerState.STOPPED
+                onStateChanged(ServerState.STOPPED)
+                onShutdownComplete()
+            }
+        }
         return true
     }
 
     fun destroySync(timeoutMs: Long = 800L) {
+        val runToStop = currentRun
+        runToStop?.stopRequested = true
+        runToStop?.forcedKillRequested = true
+
         activeJob?.cancel()
         activeJob = null
 
-        val proc = currentProcess
+        val proc = runToStop?.process ?: currentProcess
         currentProcess = null
+        currentRun = null
 
         if (proc != null && proc.isAlive) {
             terminateProcessSync(proc, timeoutMs)

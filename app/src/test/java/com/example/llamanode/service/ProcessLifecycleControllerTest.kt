@@ -27,7 +27,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class FakeProcess(
     private var alive: Boolean = true,
     private var exitCode: Int = 0,
-    private val output: String = "Starting RPC server\ntransport      : TCP\n"
+    private val output: String = "Starting RPC server\ntransport      : TCP\n",
+    private val destroyExitCode: Int = 0,
+    private val forceDestroyExitCode: Int = 137
 ) : Process() {
     var wasDestroyed: Boolean = false
     var wasForciblyDestroyed: Boolean = false
@@ -50,11 +52,13 @@ class FakeProcess(
 
     override fun destroy() {
         wasDestroyed = true
+        exitCode = destroyExitCode
         alive = false
     }
 
     override fun destroyForcibly(): Process {
         wasForciblyDestroyed = true
+        exitCode = forceDestroyExitCode
         alive = false
         return this
     }
@@ -467,5 +471,242 @@ class ProcessLifecycleControllerTest {
 
         // HIGH-02: State MUST remain ERROR and not be wiped to STOPPED
         assertEquals(ServerState.ERROR, controller.state)
+    }
+
+    @Test
+    fun testIntentionalSigterm143ReportsStoppedWithoutError() = runBlocking {
+        val fakeProcess = FakeProcess(alive = true, exitCode = 0, destroyExitCode = 143)
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ -> fakeProcess },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onShutdownComplete = { shutdownCompleted.set(true) }
+        )
+
+        controller.start(createConfig())
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(ServerState.RUNNING, controller.state)
+
+        // User stops the server -> SIGTERM (143) is intentional
+        val stopped = controller.stop()
+        assertTrue(stopped)
+        assertEquals(ServerState.STOPPED, controller.state)
+        assertTrue(fakeProcess.wasDestroyed)
+        assertEquals(143, fakeProcess.exitValue())
+        assertTrue("No error should be recorded for intentional stop with exit code 143", errors.isEmpty())
+        assertTrue("Log should indicate clean stop by user", logs.any { it.contains("stopped cleanly by user") })
+        assertTrue(shutdownCompleted.get())
+    }
+
+    @Test
+    fun testUnexpectedSigterm143ReportsError() = runBlocking {
+        val fakeProcess = FakeProcess(alive = true, exitCode = 0)
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ -> fakeProcess },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onShutdownComplete = { shutdownCompleted.set(true) }
+        )
+
+        controller.start(createConfig())
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(ServerState.RUNNING, controller.state)
+
+        // Process killed externally by SIGTERM (143) without user stop request
+        fakeProcess.kill(143)
+
+        retries = 0
+        while (controller.state != ServerState.ERROR && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals(ServerState.ERROR, controller.state)
+        assertTrue(errors.any { it.contains("unexpected SIGTERM (exit code 143)") })
+        assertTrue(shutdownCompleted.get())
+    }
+
+    @Test
+    fun testUnexpectedSigkill137SimulatedOOMReportsError() = runBlocking {
+        val fakeProcess = FakeProcess(alive = true, exitCode = 0)
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ -> fakeProcess },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onShutdownComplete = { shutdownCompleted.set(true) }
+        )
+
+        controller.start(createConfig())
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(ServerState.RUNNING, controller.state)
+
+        // Process killed by Android Low Memory Killer (SIGKILL 137) without user stop request
+        fakeProcess.kill(137)
+
+        retries = 0
+        while (controller.state != ServerState.ERROR && retries < 50) {
+            delay(50)
+            retries++
+        }
+
+        assertEquals(ServerState.ERROR, controller.state)
+        assertTrue(errors.any { it.contains("unexpected SIGKILL/OOM (exit code 137)") })
+        assertTrue(shutdownCompleted.get())
+    }
+
+    @Test
+    fun testUserForcedTerminationDistinguished() = runBlocking {
+        val fakeProcess = FakeProcess(alive = true, exitCode = 0, forceDestroyExitCode = 137)
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ -> fakeProcess },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onShutdownComplete = { shutdownCompleted.set(true) }
+        )
+
+        controller.start(createConfig())
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(ServerState.RUNNING, controller.state)
+
+        controller.currentRunInstance?.forcedKillRequested = true
+        val stopped = controller.stop()
+        assertTrue(stopped)
+
+        assertEquals(ServerState.STOPPED, controller.state)
+        assertTrue(logs.any { it.contains("forced termination") })
+        assertTrue(errors.isEmpty())
+    }
+
+    @Test
+    fun testStopFollowedByRestartDoesNotOverwriteNewWorkerState() = runBlocking {
+        var processCounter = 0
+        val proc1 = FakeProcess(alive = true, exitCode = 0, destroyExitCode = 143)
+        val proc2 = FakeProcess(alive = true, exitCode = 0)
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ ->
+                processCounter++
+                if (processCounter == 1) proc1 else proc2
+            },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onShutdownComplete = { shutdownCompleted.set(true) }
+        )
+
+        // Start run 1
+        controller.start(createConfig())
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(ServerState.RUNNING, controller.state)
+        val run1Id = controller.currentRunInstance?.id
+        assertNotNull(run1Id)
+
+        // Stop run 1
+        controller.stop()
+        assertEquals(ServerState.STOPPED, controller.state)
+
+        // Start run 2
+        val start2 = controller.start(createConfig())
+        assertEquals(StartResult.STARTED, start2)
+        val run2Id = controller.currentRunInstance?.id
+        assertNotNull(run2Id)
+        assertTrue(run2Id!! > run1Id!!)
+
+        retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(ServerState.RUNNING, controller.state)
+
+        // If proc1 delayed exit occurs now, it must NOT overwrite run2's RUNNING state with STOPPED
+        proc1.kill(143)
+        delay(100)
+
+        assertEquals(ServerState.RUNNING, controller.state)
+        assertEquals(proc2, controller.processInstance)
+        assertEquals(run2Id, controller.currentRunInstance?.id)
+    }
+
+    @Test
+    fun testOldProcessCannotRemoveForegroundServiceOrLocksOfNewRun() = runBlocking {
+        var shutdownCount = 0
+        var processCounter = 0
+        val proc1 = FakeProcess(alive = true, exitCode = 0, destroyExitCode = 143)
+        val proc2 = FakeProcess(alive = true, exitCode = 0)
+
+        val controller = ProcessLifecycleController(
+            scope = testScope,
+            processLauncher = { _, _, _ ->
+                processCounter++
+                if (processCounter == 1) proc1 else proc2
+            },
+            portChecker = { _, _ -> true },
+            onStateChanged = { stateTransitions.add(it) },
+            onLog = { logs.add(it) },
+            onError = { errors.add(it) },
+            onShutdownComplete = { shutdownCount++ }
+        )
+
+        controller.start(createConfig())
+        var retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(1L, controller.currentRunInstance?.id)
+
+        controller.stop()
+        assertEquals(1, shutdownCount)
+
+        controller.start(createConfig())
+        retries = 0
+        while (controller.state != ServerState.RUNNING && retries < 50) {
+            delay(50)
+            retries++
+        }
+        assertEquals(2L, controller.currentRunInstance?.id)
+
+        // Simulate an old proc1 delayed termination event
+        proc1.kill(143)
+        delay(100)
+
+        // Shutdown count must remain 1 because proc1 was superseded by run #2
+        assertEquals("Old run must not call onShutdownComplete for newer run", 1, shutdownCount)
+        assertEquals(ServerState.RUNNING, controller.state)
     }
 }
